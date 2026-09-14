@@ -1,0 +1,24 @@
+# Google Colab runtime dependencies (Python 3.13 compatible).
+#
+# PyTorch and torch-geometric are intentionally omitted. Colab provides the
+# CUDA-enabled PyTorch build; scripts/install_colab.py in this repository installs PyG against its
+# exact Torch/CUDA ABI. These dependency ranges are intentionally independent
+# from requirements.txt: the latter pins sentence-transformers 2.2.2 for the
+# local target device, whereas Colab uses current wheels compatible with its
+# Python runtime.
+
+drain3>=0.9.11
+fastparquet>=2024.11.0
+langchain-openai>=0.3.7
+matplotlib>=3.10.0
+networkx>=3.4.2
+numpy>=2.1.0
+openai>=1.63.2
+pandas>=2.2.3
+pyarrow>=18.1.0
+pydantic>=2.10.6
+python-dotenv>=1.0.1
+PyYAML>=6.0.2
+scikit-learn>=1.6.1
+sentence-transformers>=5.0.0,<6.0.0
+tqdm>=4.67.1
