@@ -1,6 +1,19 @@
 .ipynb_checkpoints/
 .DS_Store
 .env
+.env.*
 .venv/
 __pycache__/
 *.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Generated datasets, models, and experiment artifacts
+data/
+artifacts/
+artifacts_colab/
+models/
+outputs/
+campaigns/
+/runs/
