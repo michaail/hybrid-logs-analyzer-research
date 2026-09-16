@@ -30,6 +30,7 @@ DATASET_FILTERS = {
         "artifacts/cache/hdfs/**",
         "outputs/hdfs/**",
         "artifacts/runs/**",
+        "campaigns/**",
     ],
 }
 ALL_FILTERS = [
@@ -39,6 +40,7 @@ ALL_FILTERS = [
     "models/**",
     "outputs/**",
     "runs/**",
+    "campaigns/**",
 ]
 
 

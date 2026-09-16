@@ -1,0 +1,57 @@
+# All relative paths are resolved from --workspace-root, never from the
+# notebook's current directory.  In Colab this is /content/workspace.
+experiment:
+  name: baseline_full
+  dataset: bgl
+  run_id: null
+  seed: 42
+
+paths:
+  raw_dir: data/raw
+  artifact_dir: artifacts
+  models_dir: models
+  outputs_dir: outputs
+
+parser:
+  hdfs:
+    raw_file: HDFS_full.log
+    config: configs/drain.ini
+  bgl:
+    raw_file: BGL_full.log
+    config: configs/drain_bgl.ini
+
+sequencing:
+  bgl:
+    window_minutes: 20
+    step_minutes: 10
+
+ablation:
+  llm_enrichment_enabled: true
+  enrichment_model_size: large
+  # Thesis-comparable HDFS graphs use the original notebook feature encoding.
+  # Set stabilized_v2 only as an explicit Family A arm.
+  feature_contract: notebook_raw_v1
+  embeddings:
+    tfidf_enabled: true
+    sbert_enabled: true
+  graph:
+    use_edge_features: true
+    gine_aggregation: sum
+    node_transformation: mlp
+
+training:
+  train_mode: clean
+  test_run: false
+  test_samples: 5000
+  hidden_dim: 128
+  latent_dim: 64
+  batch_size: 256
+  epochs: 25
+  learning_rate:
+    hdfs: 0.01
+    bgl: 0.001
+  alpha: 1.0
+  beta: 1.0
+  gamma: 1.0
+  pre_normalize_edges: true
+  minimum_edge_std: 0.1

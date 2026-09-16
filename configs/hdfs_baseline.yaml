@@ -1,0 +1,65 @@
+# Selected HDFS experiment configuration for the parity baseline release.
+# Metrics, checksums, and ordered block IDs are recorded in
+# context/foundation/hdfs-parity-baseline.md from the reviewed run —
+# never inferred here.
+#
+# All relative paths are resolved from --workspace-root, never from the
+# notebook's current directory.  In Colab this is /content/workspace.
+experiment:
+  name: hdfs_baseline
+  dataset: hdfs
+  run_id: null
+  seed: 42
+
+paths:
+  raw_dir: data/raw
+  artifact_dir: artifacts
+  models_dir: models
+  outputs_dir: outputs
+
+parser:
+  hdfs:
+    raw_file: HDFS_full.log
+    config: configs/drain.ini
+  bgl:
+    raw_file: BGL_full.log
+    config: configs/drain_bgl.ini
+
+sequencing:
+  bgl:
+    window_minutes: 20
+    step_minutes: 10
+
+inference_release:
+  # This selected run was trained by 5_PrepareDataset.ipynb, before the
+  # stabilized log-scaled graph features were introduced.
+  feature_contract: notebook_raw_v1
+
+ablation:
+  llm_enrichment_enabled: true
+  enrichment_model_size: large
+  feature_contract: notebook_raw_v1
+  embeddings:
+    tfidf_enabled: true
+    sbert_enabled: true
+  graph:
+    use_edge_features: true
+    gine_aggregation: sum
+    node_transformation: mlp
+
+training:
+  train_mode: clean
+  test_run: false
+  test_samples: 5000
+  hidden_dim: 128
+  latent_dim: 64
+  batch_size: 256
+  epochs: 25
+  learning_rate:
+    hdfs: 0.01
+    bgl: 0.001
+  alpha: 1.0
+  beta: 1.0
+  gamma: 1.0
+  pre_normalize_edges: true
+  minimum_edge_std: 0.1

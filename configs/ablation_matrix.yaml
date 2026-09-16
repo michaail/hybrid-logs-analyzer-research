@@ -1,0 +1,34 @@
+# DEPRECATED mixed matrix.
+#
+# Family A (rebuild graphs): configs/ablation_representation.yaml
+# Family B (train-only):     configs/ablation_train.yaml
+#
+# This file now re-exports Family B only so an accidental
+# `run_ablation.py --mode train-only --matrix configs/ablation_matrix.yaml`
+# remains scientifically valid. Representation arms are NOT listed here.
+deprecated: true
+family: train
+requires_graph_rebuild: false
+redirect:
+  family_a: configs/ablation_representation.yaml
+  family_b: configs/ablation_train.yaml
+experiments:
+  - name: baseline_full
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: baseline_full
+
+  - name: gine_mean_agg
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: gine_mean_agg
+      ablation.graph.gine_aggregation: mean
+
+  - name: linear_node_transform
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: linear_node_transform
+      ablation.graph.node_transformation: linear

@@ -1,0 +1,40 @@
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_1 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_1 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_2 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_2 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_3 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_3 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_4 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_4 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_5 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_5 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_6 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_6 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_7 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_7 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_8 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_8 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_9 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_9 terminating
+081109 203615 148 INFO dfs.DataNode$DataXceiver: Receiving block blk_10 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_10 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_11 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_11 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_12 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_12 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_13 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_13 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_14 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_14 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_15 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_15 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_16 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_16 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_17 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_17 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_18 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_18 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_19 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_19 terminating
+081109 203615 148 WARN dfs.DataNode$DataXceiver: Receiving block blk_20 src: /10.0.0.1:50010 dest: /10.0.0.2:50010
+081109 203616 148 WARN dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_20 terminating
