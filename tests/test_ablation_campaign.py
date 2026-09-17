@@ -103,6 +103,20 @@ def test_enrichment_rejects_small_and_both_models() -> None:
         enrich_templates([{"template": "x", "cluster_id": 0}], "hdfs", model_size="both")
 
 
+def test_optional_workspace_relative_allows_resume_without_templates() -> None:
+    import run_ablation
+
+    workspace = REPOSITORY_ROOT
+    assert run_ablation._optional_workspace_relative(None, workspace, "cached/templates.json") == (
+        "cached/templates.json"
+    )
+    assert run_ablation._optional_workspace_relative(None, workspace) is None
+    relative = run_ablation._optional_workspace_relative(
+        workspace / "configs" / "ablation_base.yaml", workspace
+    )
+    assert relative == "configs/ablation_base.yaml"
+
+
 def test_feature_contract_defaults_to_notebook_raw() -> None:
     config = _baseline_config()
     assert feature_contract_from_config(config) == "notebook_raw_v1"

@@ -1154,6 +1154,14 @@ def _workspace_relative(path: Path, workspace: Path) -> str:
         return str(path.resolve())
 
 
+def _optional_workspace_relative(
+    path: str | Path | None, workspace: Path, fallback: str | None = None
+) -> str | None:
+    if path is None:
+        return fallback
+    return _workspace_relative(Path(path), workspace)
+
+
 def _checkpoint_workspace(workspace: Path, checkpoint_root: str | Path | None) -> None:
     """Copy completed, ignored artifacts to a mounted durable workspace.
 
@@ -1367,11 +1375,20 @@ def prepare_representation_campaign(
         _checkpoint_workspace(workspace, checkpoint_root)
         print(f"[CAMPAIGN] {name} → {compressed}")
 
+    previous: dict[str, Any] = {}
+    previous_manifest = destination / "manifest.json"
+    if previous_manifest.exists():
+        try:
+            loaded = json.loads(previous_manifest.read_text())
+        except json.JSONDecodeError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            previous = loaded
     extra = {
         "code_sha": git_revision(code),
         "matrix": str(matrix_file),
-        "templates": _workspace_relative(Path(templates), workspace),
-        "sequences": _workspace_relative(Path(sequences), workspace),
+        "templates": _optional_workspace_relative(templates, workspace, previous.get("templates")),
+        "sequences": _optional_workspace_relative(sequences, workspace, previous.get("sequences")),
     }
     manifest_path = write_campaign_manifest(
         destination,
