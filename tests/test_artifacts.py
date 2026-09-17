@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,39 @@ def test_failed_stage_never_publishes_success_manifest(tmp_path: Path) -> None:
         store.stage(stage="build", stage_config={}, inputs=[source], build=fail)
 
     assert not list((tmp_path / "artifacts").rglob(SUCCESS_FILE))
+
+
+def test_stage_replaces_stale_nonempty_destination(tmp_path: Path) -> None:
+    source = tmp_path / "input.txt"
+    source.write_text("input")
+    store = ArtifactStore(tmp_path, "hdfs", Path(__file__).parents[1])
+
+    def build(stage_dir: Path) -> dict[str, Path]:
+        output = stage_dir / "result.txt"
+        output.write_text("fresh")
+        return {"result": output}
+
+    outputs, _, reused = store.stage(
+        stage="parse",
+        stage_config={"version": 1},
+        inputs=[source],
+        build=build,
+    )
+    assert not reused
+    stale = outputs["result"].parent
+    for child in list(stale.iterdir()):
+        if child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+    (stale / ".DS_Store").write_bytes(b"finder")
+
+    outputs, _, reused = store.stage(
+        stage="parse",
+        stage_config={"version": 1},
+        inputs=[source],
+        build=build,
+    )
+    assert not reused
+    assert outputs["result"].read_text() == "fresh"
+    assert (outputs["result"].parent / SUCCESS_FILE).exists()

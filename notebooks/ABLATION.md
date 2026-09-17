@@ -14,11 +14,13 @@ This file is the operational contract. Implementation lives in this repository (
 
 `configs/ablation_matrix.yaml` is deprecated. It now re-exports Family B only so an accidental shared-graph `train-only` run cannot fake a TF-IDF vs SBERT ablation.
 
-Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT, edge features, `feature_contract`) disagrees with `dataset_meta.json` on the bundle.
+Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT, edge features, `feature_contract`, `unique_sequences`) disagrees with `dataset_meta.json` on the bundle.
 
 ## Invariants
 
 - One Drain parse, one HDFS block sequencing, **one split lock** (`split_lock.npz`) shared by every Family A graph.
+- Family A does **not** rebuild collapsed topology seven times. Stage `stage45_graph_structure` caches per-block extras and 10-d edges keyed by dataset + `unique_sequences` + `feature_contract`. Embedding arms (`tfidf_only`, `sbert_only`, `no_llm_enrichment`, …) splice a new node matrix; `no_edge_features` keeps the first edge column. Only `feature_contract_stabilized_v2` needs a second structure pass.
+- HDFS Family A graphs are **unique template sequences** (`ablation.graph.unique_sequences: true`): one PyG graph per distinct ordered `cluster_id` list (~17.6k), not one per block (~575k). Parameters and time-delta edges come from a representative block; mixed-label fingerprints keep one normal and one anomalous example. This is **not comparable** to an all-block campaign — do not reuse a 575k `split_lock.npz`. Opt out with `--set ablation.graph.unique_sequences=false`.
 - Seed 42, clean-train, val-F1 threshold, report test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
 - LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Mistral large/small are not ablation arms.
 - Default `ablation.feature_contract: notebook_raw_v1` (thesis-comparable). `stabilized_v2` is an explicit Family A arm.
@@ -107,7 +109,7 @@ hybrid-log-analyzer-artifacts/
 
 ## BGL
 
-Same two-family protocol as HDFS. Graphs are disjoint 20-minute windows. Do not use overlapping windows with the random stratified graph split: adjacent windows would share raw log records across train, validation, and test. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
+Same two-family protocol as HDFS. Graphs are disjoint 20-minute windows (**all windows**, not unique-sequence dedup). Do not use overlapping windows with the random stratified graph split: adjacent windows would share raw log records across train, validation, and test. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
 
 Published campaign metrics require `SMOKE=False` (25 epochs and complete splits). A smoke run uses one epoch and at most 5,000 graphs per split and is only a pipeline diagnostic. Use a new campaign ID when replacing an already published smoke campaign.
 

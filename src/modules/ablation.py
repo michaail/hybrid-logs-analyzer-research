@@ -26,6 +26,7 @@ LEGACY_GRAPH_IDENTITY: dict[str, Any] = {
     "sbert_enabled": True,
     "use_edge_features": True,
     "feature_contract": "notebook_raw_v1",
+    "unique_sequences": False,
 }
 
 GRAPH_IDENTITY_KEYS = tuple(LEGACY_GRAPH_IDENTITY.keys())
@@ -45,6 +46,16 @@ def feature_contract_from_config(config: Mapping[str, Any]) -> str:
     return str(release.get("feature_contract", "stabilized_v2"))
 
 
+def unique_sequences_from_config(config: Mapping[str, Any]) -> bool:
+    """HDFS unique-sequence graphs; always ``False`` for BGL."""
+    experiment = config.get("experiment") or {}
+    dataset = str(experiment.get("dataset") or "bgl").lower()
+    if dataset != "hdfs":
+        return False
+    graph = (config.get("ablation") or {}).get("graph") or {}
+    return bool(graph.get("unique_sequences", True))
+
+
 def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return the representation knobs that require a distinct graph bundle."""
     ablation = config["ablation"]
@@ -59,6 +70,7 @@ def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "sbert_enabled": bool(embeddings.get("sbert_enabled", True)),
         "use_edge_features": bool(graph.get("use_edge_features", True)),
         "feature_contract": feature_contract_from_config(config),
+        "unique_sequences": unique_sequences_from_config(config),
     }
 
 
@@ -74,21 +86,40 @@ def graph_identity_from_meta(meta: Mapping[str, Any] | None) -> dict[str, Any] |
         }
     llm_enabled = meta.get("llm_enrichment_enabled")
     if llm_enabled is None and "graph_identity" in meta:
-        return {key: meta["graph_identity"].get(key) for key in GRAPH_IDENTITY_KEYS}
+        return _complete_graph_identity(meta["graph_identity"])
     if llm_enabled is None and not embeddings and "use_edge_features" not in meta:
         return None
     if llm_enabled is None:
         return None
     llm_enabled = bool(llm_enabled)
     size = meta.get("enrichment_model_size")
-    return {
-        "llm_enrichment_enabled": llm_enabled,
-        "enrichment_model_size": (str(size) if size is not None else "large") if llm_enabled else None,
-        "tfidf_enabled": bool(embeddings.get("tfidf_enabled", True)),
-        "sbert_enabled": bool(embeddings.get("sbert_enabled", True)),
-        "use_edge_features": bool(meta.get("use_edge_features", True)),
-        "feature_contract": str(meta.get("feature_contract", "notebook_raw_v1")),
-    }
+    return _complete_graph_identity(
+        {
+            "llm_enrichment_enabled": llm_enabled,
+            "enrichment_model_size": (str(size) if size is not None else "large") if llm_enabled else None,
+            "tfidf_enabled": bool(embeddings.get("tfidf_enabled", True)),
+            "sbert_enabled": bool(embeddings.get("sbert_enabled", True)),
+            "use_edge_features": bool(meta.get("use_edge_features", True)),
+            "feature_contract": str(meta.get("feature_contract", "notebook_raw_v1")),
+            "unique_sequences": _unique_sequences_from_meta(meta),
+        }
+    )
+
+
+def _unique_sequences_from_meta(meta: Mapping[str, Any]) -> bool:
+    if "unique_sequences" in meta:
+        return bool(meta["unique_sequences"])
+    nested = meta.get("graph_identity")
+    if isinstance(nested, Mapping) and "unique_sequences" in nested:
+        return bool(nested["unique_sequences"])
+    return False
+
+
+def _complete_graph_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Fill identity keys; missing ``unique_sequences`` is the all-block baseline."""
+    identity = {key: raw.get(key) for key in GRAPH_IDENTITY_KEYS}
+    identity["unique_sequences"] = bool(raw.get("unique_sequences", False))
+    return identity
 
 
 def identities_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:

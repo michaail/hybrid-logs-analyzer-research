@@ -48,6 +48,7 @@ from src.modules.ablation import (
     load_split_lock,
     save_split_lock,
     sequence_ids_from_graphs,
+    unique_sequences_from_config,
     write_campaign_manifest,
     write_campaign_report,
     write_eval_pack,
@@ -55,12 +56,16 @@ from src.modules.ablation import (
 from src.modules.artifacts import SUCCESS_FILE, ArtifactStore, fingerprint, git_revision, input_metadata
 from src.modules.dataset import (
     _require_torch_geometric,
-    build_pyg_dataset,
+    attach_cluster_embeddings,
+    build_graph_structures,
     compute_embeddings,
+    load_graph_structures,
     save_graph_dataset,
+    save_graph_structures,
     split_dataset,
 )
 from src.modules.enrichment import enrich_templates, load_enriched_templates
+from src.modules.graph_builder import select_unique_sequences
 from src.modules.inference_release import (
     HdfsReleaseIdentity,
     HdfsReleaseSource,
@@ -69,6 +74,9 @@ from src.modules.inference_release import (
 from src.modules.parser import BGLParser, DrainParser
 from src.modules.sequencer import build_sequences, load_sequences, save_sequences
 from src.modules.utils import get_device, seed_everything
+
+# Embedding-agnostic graph structures, reused across Family A arms in one process.
+_GRAPH_STRUCTURE_MEMO: dict[str, tuple[list, dict[str, Any]]] = {}
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -243,11 +251,11 @@ def stage45_build_dataset(
         )
         if not bool(ablation["llm_enrichment_enabled"]):
             cluster_to_enriched = {}
-        _, sequences = load_sequences(sequences_path, dataset)
-        labels = _sequence_labels(
-            dataset=dataset,
-            sequences=sequences,
-            labels_path=labels_path if dataset == "hdfs" else None,
+        structures, unique_stats = _ensure_graph_structures(
+            config,
+            sequences_path,
+            labels_path,
+            store=store,
         )
         embeddings, cluster_ids, _ = compute_embeddings(
             templates,
@@ -260,18 +268,13 @@ def stage45_build_dataset(
             for cluster_id, embedding in zip(cluster_ids, embeddings, strict=True)
         }
         print(
-            f"[GRAPH] building {len(sequences)} {dataset} graphs "
-            "(this can take a long time after the SBERT bar finishes)",
+            f"[GRAPH] splicing embeddings onto {len(structures)} {dataset} graphs",
             flush=True,
         )
-        data_list = build_pyg_dataset(
-            sequences,
-            labels,
+        data_list = attach_cluster_embeddings(
+            structures,
             cluster_embeddings,
             use_edge_features=bool(ablation["graph"]["use_edge_features"]),
-            dataset=dataset,
-            hdfs_feature_contract=feature_contract_from_config(config),  # type: ignore[arg-type]
-            on_graph_error="fail",
         )
         if not data_list:
             raise ValueError("Graph builder produced no examples.")
@@ -315,6 +318,10 @@ def stage45_build_dataset(
             "feature_contract": identity["feature_contract"],
             "graph_identity": identity,
             "split_lock_id": lock_id,
+            "unique_sequences": identity["unique_sequences"],
+            "n_raw": unique_stats["n_raw"],
+            "n_unique": unique_stats["n_unique"],
+            "n_mixed_label_fingerprints": unique_stats["n_mixed_label_fingerprints"],
         }
         graph_path = temp_dir / "graph_dataset.pt"
         save_graph_dataset(
@@ -1072,7 +1079,116 @@ def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
         "enrichment_model_size": ablation.get("enrichment_model_size"),
         "enrichment_backend": "deepseek-v4-pro" if ablation.get("llm_enrichment_enabled") else None,
         "feature_contract": feature_contract_from_config(config),
+        "unique_sequences": unique_sequences_from_config(config),
     }
+
+
+def _stage45_structure_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Knobs that require rebuilding collapsed topology / extras / time-deltas."""
+    return {
+        "dataset": _dataset(config),
+        "unique_sequences": unique_sequences_from_config(config),
+        "feature_contract": feature_contract_from_config(config),
+    }
+
+
+def _ensure_graph_structures(
+    config: dict[str, Any],
+    sequences_path: str | Path,
+    labels_path: str | Path,
+    *,
+    store: ArtifactStore,
+) -> tuple[list, dict[str, int]]:
+    """Reuse embedding-agnostic graph structures across Family A arms."""
+    dataset = _dataset(config)
+    sequences_path = Path(sequences_path).resolve()
+    inputs = [sequences_path]
+    if dataset == "hdfs":
+        inputs.append(Path(labels_path).resolve())
+    stage_config = _stage45_structure_config(config)
+    built: dict[str, tuple[list, dict[str, Any]]] = {}
+
+    def build(temp_dir: Path) -> dict[str, Path]:
+        _, sequences = load_sequences(sequences_path, dataset)
+        labels = _sequence_labels(
+            dataset=dataset,
+            sequences=sequences,
+            labels_path=labels_path if dataset == "hdfs" else None,
+        )
+        unique_stats = {
+            "n_raw": len(sequences),
+            "n_unique": len(sequences),
+            "n_mixed_label_fingerprints": 0,
+        }
+        if unique_sequences_from_config(config):
+            sequences, labels, unique_stats = select_unique_sequences(sequences, labels)
+            print(
+                f"[GRAPH] unique sequences: {unique_stats['n_unique']} / "
+                f"{unique_stats['n_raw']} "
+                f"({unique_stats['n_mixed_label_fingerprints']} mixed-label fingerprints)",
+                flush=True,
+            )
+        print(
+            f"[GRAPH] building {len(sequences)} {dataset} structures "
+            f"(contract={stage_config['feature_contract']})",
+            flush=True,
+        )
+        structures, stats = build_graph_structures(
+            sequences,
+            labels,
+            dataset=dataset,
+            hdfs_feature_contract=feature_contract_from_config(config),  # type: ignore[arg-type]
+            on_graph_error="fail",
+        )
+        if not structures:
+            raise ValueError("Graph builder produced no examples.")
+        meta = {
+            **unique_stats,
+            **stats,
+            "dataset": dataset,
+            "feature_contract": stage_config["feature_contract"],
+            "unique_sequences": stage_config["unique_sequences"],
+        }
+        structure_path = temp_dir / "graph_structure.pkl"
+        save_graph_structures(structure_path, structures, meta)
+        built["payload"] = (structures, meta)
+        meta_path = temp_dir / "structure_meta.json"
+        meta_path.write_text(json.dumps(meta, indent=2, default=str))
+        return {"graph_structure": structure_path, "structure_meta": meta_path}
+
+    outputs, _, reused = store.stage(
+        stage="stage45_graph_structure",
+        stage_config=stage_config,
+        inputs=inputs,
+        build=build,
+    )
+    _announce("stage45_graph_structure", reused)
+    memo_key = str(outputs["graph_structure"].resolve())
+    cached = _GRAPH_STRUCTURE_MEMO.get(memo_key)
+    if cached is None and "payload" in built:
+        cached = built["payload"]
+        _GRAPH_STRUCTURE_MEMO[memo_key] = cached
+    if cached is None:
+        cached = load_graph_structures(outputs["graph_structure"])
+        _GRAPH_STRUCTURE_MEMO[memo_key] = cached
+        print(
+            f"[GRAPH] loaded {len(cached[0])} cached structures "
+            f"(contract={stage_config['feature_contract']})",
+            flush=True,
+        )
+    elif reused:
+        print(
+            f"[GRAPH] reusing in-memory structures "
+            f"({len(cached[0])} graphs, contract={stage_config['feature_contract']})",
+            flush=True,
+        )
+    structures, meta = cached
+    unique_stats = {
+        "n_raw": int(meta.get("n_raw", len(structures))),
+        "n_unique": int(meta.get("n_unique", len(structures))),
+        "n_mixed_label_fingerprints": int(meta.get("n_mixed_label_fingerprints", 0)),
+    }
+    return structures, unique_stats
 
 
 def _stage6_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -1554,6 +1670,10 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
             if "use_edge_features" in identity:
                 overrides.append(
                     f"ablation.graph.use_edge_features={json.dumps(identity['use_edge_features'])}"
+                )
+            if "unique_sequences" in identity:
+                overrides.append(
+                    f"ablation.graph.unique_sequences={json.dumps(identity['unique_sequences'])}"
                 )
             if identity.get("feature_contract"):
                 overrides.append(

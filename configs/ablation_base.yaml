@@ -38,6 +38,8 @@ ablation:
     sbert_enabled: true
   graph:
     use_edge_features: true
+    # HDFS only: one PyG graph per unique cluster_id sequence. Ignored for BGL.
+    unique_sequences: true
     gine_aggregation: sum
     node_transformation: mlp
 

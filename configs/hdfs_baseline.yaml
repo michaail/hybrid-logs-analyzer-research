@@ -44,6 +44,7 @@ ablation:
     sbert_enabled: true
   graph:
     use_edge_features: true
+    unique_sequences: false
     gine_aggregation: sum
     node_transformation: mlp
 

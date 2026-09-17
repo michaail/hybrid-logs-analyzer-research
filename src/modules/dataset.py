@@ -11,14 +11,19 @@ At least one must be True.
 Public API
 ----------
     compute_embeddings(templates_data, cluster_to_enriched, *, ...) → (ndarray, cids, vec)
+    build_graph_structures(sequences, block_labels, *, ...) → (list[dict], stats)
+    attach_cluster_embeddings(structures, cluster_embeddings, *, ...) → list[Data]
     build_pyg_dataset(sequences, block_labels, cluster_embeddings, *, ...) → list[Data]
     split_dataset(all_data, seed, *, ...) → (idx_train, idx_val, idx_test)
     save_graph_dataset(all_data, ..., path, *, ...)
+    save_graph_structures(path, structures, meta)
+    load_graph_structures(path) → (structures, meta)
 """
 
 from __future__ import annotations
 
 import logging
+import pickle
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -29,6 +34,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 HdfsFeatureContract = Literal["notebook_raw_v1", "stabilized_v2"]
+NODE_EXTRA_DIM = 9
+STRUCTURE_EDGE_DIM = 10
+STRUCTURE_CACHE_VERSION = 1
 
 
 class MissingClusterEmbedding(ValueError):
@@ -140,7 +148,153 @@ def compute_embeddings(
     return hybrid_embeddings, all_cids, tfidf_vectorizer
 
 
-# ── PyG graph construction ────────────────────────────────────────────────────
+# ── Graph structure (embedding-agnostic) ──────────────────────────────────────
+
+
+def build_graph_structures(
+    sequences: dict,
+    block_labels: dict,
+    *,
+    dataset: str = "bgl",
+    on_graph_error: Literal["skip", "fail"] = "skip",
+    hdfs_feature_contract: HdfsFeatureContract = "stabilized_v2",
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build collapsed topology + node/edge extras, without template embeddings.
+
+    Family A arms that share ``dataset``, ``unique_sequences``, and
+    ``feature_contract`` can reuse this list and splice a different embedding
+    matrix. Full 10-d edges are always stored; ``use_edge_features=False`` is a
+    later column slice, not a second construction pass.
+    """
+    structures: list[dict[str, Any]] = []
+    skipped = 0
+    t0 = time.time()
+    from tqdm import tqdm
+
+    iterator = tqdm(
+        sequences.items(),
+        total=len(sequences),
+        desc="Graph structure",
+        unit="seq",
+        mininterval=2.0,
+    )
+    for wid, seq in iterator:
+        label = block_labels.get(wid, 0)
+        try:
+            structures.append(
+                _seq_to_structure(
+                    seq,
+                    label,
+                    dataset=dataset,
+                    hdfs_feature_contract=hdfs_feature_contract,
+                )
+            )
+        except Exception as exc:
+            if on_graph_error == "fail":
+                raise
+            skipped += 1
+            if skipped <= 5:
+                logger.warning("Skipped sequence %s: %s", wid, exc)
+
+    stats = {"n_graphs": len(structures), "n_skipped": skipped}
+    logger.info(
+        "Built %d graph structures in %.1fs  (skipped %d)",
+        stats["n_graphs"],
+        time.time() - t0,
+        skipped,
+    )
+    return structures, stats
+
+
+def attach_cluster_embeddings(
+    structures: list[dict[str, Any]],
+    cluster_embeddings: dict[int, np.ndarray],
+    *,
+    use_edge_features: bool = True,
+    missing_embedding: Literal["zero", "fail"] = "zero",
+) -> list:
+    """Splice template embeddings onto cached structures to produce PyG graphs."""
+    _require_torch_geometric()
+    import torch
+    from torch_geometric.data import Data
+
+    normalized = {
+        int(cid): np.asarray(vector, dtype=np.float32)
+        for cid, vector in cluster_embeddings.items()
+    }
+    embed_dim = next(iter(normalized.values())).shape[0]
+    if missing_embedding == "fail":
+        for structure in structures:
+            for cluster_id in structure["cluster_ids"]:
+                if int(cluster_id) not in normalized:
+                    raise MissingClusterEmbedding(int(cluster_id))
+
+    from tqdm import tqdm
+
+    all_data = []
+    t0 = time.time()
+    iterator = tqdm(
+        structures,
+        total=len(structures),
+        desc="PyG splice",
+        unit="seq",
+        mininterval=2.0,
+    )
+    for structure in iterator:
+        node_feats = _node_features_from_structure(
+            structure, normalized, embed_dim, missing_embedding
+        )
+        edge_attr_np = structure["edge_attr"]
+        if use_edge_features:
+            edge_attr_np = np.asarray(edge_attr_np, dtype=np.float32)
+        elif edge_attr_np.shape[0] == 0:
+            edge_attr_np = np.zeros((0, 1), dtype=np.float32)
+        else:
+            edge_attr_np = np.asarray(edge_attr_np[:, :1], dtype=np.float32)
+
+        id_col = structure["id_col"]
+        kwargs = {id_col: structure["seq_id"], "num_nodes": int(structure["num_nodes"])}
+        all_data.append(
+            Data(
+                x=torch.from_numpy(node_feats),
+                edge_index=torch.from_numpy(np.asarray(structure["edge_index"], dtype=np.int64)),
+                edge_attr=torch.from_numpy(edge_attr_np),
+                y=torch.tensor([int(structure["y"])], dtype=torch.long),
+                **kwargs,
+            )
+        )
+    logger.info("Spliced embeddings onto %d graphs in %.1fs", len(all_data), time.time() - t0)
+    return all_data
+
+
+def save_graph_structures(
+    path: str | Path,
+    structures: list[dict[str, Any]],
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """Persist embedding-agnostic graph structures for Family A reuse."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": STRUCTURE_CACHE_VERSION,
+        "structures": structures,
+        "meta": meta or {},
+    }
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("Graph structures saved → %s  (%.1f MB)", path, path.stat().st_size / 1e6)
+
+
+def load_graph_structures(path: str | Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load a payload written by :func:`save_graph_structures`."""
+    path = Path(path)
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+    if int(payload.get("version", -1)) != STRUCTURE_CACHE_VERSION:
+        raise ValueError(
+            f"Unsupported graph structure cache version {payload.get('version')!r} in {path}"
+        )
+    return list(payload["structures"]), dict(payload.get("meta") or {})
 
 
 def build_pyg_dataset(
@@ -178,65 +332,21 @@ def build_pyg_dataset(
     -------
     list[torch_geometric.data.Data]
     """
-    _require_torch_geometric()
-    embed_dim = next(iter(cluster_embeddings.values())).shape[0]
-    node_extra_dim = 9
-    node_dim = embed_dim + node_extra_dim
-    edge_dim = 10 if use_edge_features else 1
-
-    all_data = []
-    skipped = 0
-    t0 = time.time()
-    normalized_embeddings = {int(cid): vector for cid, vector in cluster_embeddings.items()}
-    if missing_embedding == "fail":
-        for seq in sequences.values():
-            for cluster_id in seq["cluster_id"].tolist():
-                if int(cluster_id) not in normalized_embeddings:
-                    raise MissingClusterEmbedding(int(cluster_id))
-
-    from tqdm import tqdm
-
-    iterator = tqdm(
-        sequences.items(),
-        total=len(sequences),
-        desc="PyG graphs",
-        unit="seq",
-        mininterval=2.0,
+    structures, _ = build_graph_structures(
+        sequences,
+        block_labels,
+        dataset=dataset,
+        on_graph_error=on_graph_error,
+        hdfs_feature_contract=hdfs_feature_contract,
     )
-    for wid, seq in iterator:
-        label = block_labels.get(wid, 0)
-        try:
-            data = _seq_to_pyg(
-                seq,
-                label,
-                normalized_embeddings,
-                embed_dim=embed_dim,
-                node_dim=node_dim,
-                edge_dim=edge_dim,
-                use_edge_features=use_edge_features,
-                dataset=dataset,
-                missing_embedding=missing_embedding,
-                hdfs_feature_contract=hdfs_feature_contract,
-            )
-            all_data.append(data)
-        except MissingClusterEmbedding:
-            raise
-        except ModuleNotFoundError:
-            raise
-        except Exception as exc:
-            if on_graph_error == "fail":
-                raise
-            skipped += 1
-            if skipped <= 5:
-                logger.warning("Skipped sequence %s: %s", wid, exc)
-
-    logger.info(
-        "Built %d PyG graphs in %.1fs  (skipped %d)",
-        len(all_data),
-        time.time() - t0,
-        skipped,
+    if not structures:
+        return []
+    return attach_cluster_embeddings(
+        structures,
+        cluster_embeddings,
+        use_edge_features=use_edge_features,
+        missing_embedding=missing_embedding,
     )
-    return all_data
 
 
 def split_dataset(
@@ -329,23 +439,14 @@ def _is_numeric(x: object) -> bool:
         return False
 
 
-def _seq_to_pyg(
+def _seq_to_structure(
     seq: pd.DataFrame,
     label: int,
-    cluster_embeddings: dict,
     *,
-    embed_dim: int,
-    node_dim: int,
-    edge_dim: int,
-    use_edge_features: bool,
     dataset: str,
-    missing_embedding: Literal["zero", "fail"] = "zero",
     hdfs_feature_contract: HdfsFeatureContract = "stabilized_v2",
-):
-    """Convert a single sequence DataFrame to a PyG Data object."""
-    import torch
-    from torch_geometric.data import Data
-
+) -> dict[str, Any]:
+    """Collapsed topology, 9-d node extras, and 10-d edges for one sequence."""
     ts_col = "unix_ts" if dataset.lower() == "bgl" else "timestamp"
     id_col = "window_id" if dataset.lower() == "bgl" else "block_id"
 
@@ -355,7 +456,6 @@ def _seq_to_pyg(
     ts = seq[ts_col].tolist() if ts_col in seq.columns else [None] * len(cids)
     n = len(cids)
 
-    # ── Node aggregation ──────────────────────────────────────────────────────
     node_params: dict = defaultdict(list)
     node_count = Counter(cids)
     node_positions: dict = defaultdict(list)
@@ -367,40 +467,30 @@ def _seq_to_pyg(
     unique_cids = [int(cid) for cid in dict.fromkeys(cids)]
     cid_to_idx = {cid: idx for idx, cid in enumerate(unique_cids)}
     num_nodes = len(unique_cids)
+    raw_hdfs = dataset.lower() == "hdfs" and hdfs_feature_contract == "notebook_raw_v1"
 
-    node_feats = np.zeros((num_nodes, node_dim), dtype=np.float32)
+    node_extra = np.zeros((num_nodes, NODE_EXTRA_DIM), dtype=np.float32)
     for idx, cid in enumerate(unique_cids):
-        if cid not in cluster_embeddings:
-            if missing_embedding == "fail":
-                raise MissingClusterEmbedding(int(cid))
-            emb = np.zeros(embed_dim, dtype=np.float32)
-        else:
-            emb = cluster_embeddings[cid]
         nums = [float(x) for x in node_params[cid] if _is_numeric(x)]
         pos = np.array(node_positions[cid])
-
-        node_feats[idx, :embed_dim] = emb
-        if dataset.lower() == "hdfs" and hdfs_feature_contract == "notebook_raw_v1":
-            node_feats[idx, embed_dim + 0] = float(node_count[cid])
-            node_feats[idx, embed_dim + 1] = float(len(node_params[cid]))
-            node_feats[idx, embed_dim + 2] = float(np.mean(nums)) if nums else 0.0
-            node_feats[idx, embed_dim + 3] = float(np.max(nums)) if nums else 0.0
+        if raw_hdfs:
+            node_extra[idx, 0] = float(node_count[cid])
+            node_extra[idx, 1] = float(len(node_params[cid]))
+            node_extra[idx, 2] = float(np.mean(nums)) if nums else 0.0
+            node_extra[idx, 3] = float(np.max(nums)) if nums else 0.0
         else:
-            node_feats[idx, embed_dim + 0] = float(np.log1p(node_count[cid]))
-            node_feats[idx, embed_dim + 1] = float(np.log1p(len(node_params[cid])))
-            node_feats[idx, embed_dim + 2] = (
-                float(np.log1p(abs(np.mean(nums)))) if nums else 0.0
-            )
-            node_feats[idx, embed_dim + 3] = float(np.log1p(abs(np.max(nums)))) if nums else 0.0
-        node_feats[idx, embed_dim + 4] = float(pos.min())
-        node_feats[idx, embed_dim + 5] = float(pos.max())
-        node_feats[idx, embed_dim + 6] = float(pos.mean())
-        node_feats[idx, embed_dim + 7] = float(pos.std()) if len(pos) > 1 else 0.0
-        node_feats[idx, embed_dim + 8] = float(pos.max() - pos.min())
+            node_extra[idx, 0] = float(np.log1p(node_count[cid]))
+            node_extra[idx, 1] = float(np.log1p(len(node_params[cid])))
+            node_extra[idx, 2] = float(np.log1p(abs(np.mean(nums)))) if nums else 0.0
+            node_extra[idx, 3] = float(np.log1p(abs(np.max(nums)))) if nums else 0.0
+        node_extra[idx, 4] = float(pos.min())
+        node_extra[idx, 5] = float(pos.max())
+        node_extra[idx, 6] = float(pos.mean())
+        node_extra[idx, 7] = float(pos.std()) if len(pos) > 1 else 0.0
+        node_extra[idx, 8] = float(pos.max() - pos.min())
 
-    node_feats = np.nan_to_num(node_feats, nan=0.0, posinf=0.0, neginf=0.0)
+    node_extra = np.nan_to_num(node_extra, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # ── Edge aggregation ──────────────────────────────────────────────────────
     edge_deltas: dict = defaultdict(list)
     edge_src_pos: dict = defaultdict(list)
     edge_dst_pos: dict = defaultdict(list)
@@ -415,7 +505,7 @@ def _seq_to_pyg(
         t_src, t_dst = ts[i], ts[i + 1]
         if t_src is not None and t_dst is not None:
             try:
-                if dataset.lower() == "hdfs" and hdfs_feature_contract == "notebook_raw_v1":
+                if raw_hdfs:
                     delta = (t_dst - t_src).total_seconds()
                 else:
                     delta = float(t_dst) - float(t_src)
@@ -431,57 +521,105 @@ def _seq_to_pyg(
         deltas = edge_deltas.get((src, dst), [])
         s_pos = np.array(edge_src_pos[(src, dst)])
         d_pos = np.array(edge_dst_pos[(src, dst)])
-
-        if use_edge_features:
-            ef = np.zeros(edge_dim, dtype=np.float32)
-            if dataset.lower() == "hdfs" and hdfs_feature_contract == "notebook_raw_v1":
-                ef[0] = float(len(s_pos))
-                if deltas:
-                    arr = np.array(deltas, dtype=np.float64)
-                    ef[1] = float(arr.min())
-                    ef[2] = float(np.percentile(arr, 25))
-                    ef[3] = float(np.median(arr))
-                    ef[4] = float(np.percentile(arr, 75))
-                    ef[5] = float(arr.max())
-                    ef[6] = float(arr.std())
-                else:
-                    ef[1:7] = [-1, -1, -1, -1, -1, 0]
+        ef = np.zeros(STRUCTURE_EDGE_DIM, dtype=np.float32)
+        if raw_hdfs:
+            ef[0] = float(len(s_pos))
+            if deltas:
+                arr = np.array(deltas, dtype=np.float64)
+                ef[1] = float(arr.min())
+                ef[2] = float(np.percentile(arr, 25))
+                ef[3] = float(np.median(arr))
+                ef[4] = float(np.percentile(arr, 75))
+                ef[5] = float(arr.max())
+                ef[6] = float(arr.std())
             else:
-                ef[0] = float(np.log1p(len(s_pos)))
-                if deltas:
-                    arr = np.clip(np.array(deltas, dtype=np.float64), 0.0, None)
-                    ef[1] = float(np.log1p(arr.min()))
-                    ef[2] = float(np.log1p(np.percentile(arr, 25)))
-                    ef[3] = float(np.log1p(np.median(arr)))
-                    ef[4] = float(np.log1p(np.percentile(arr, 75)))
-                    ef[5] = float(np.log1p(arr.max()))
-                    ef[6] = float(np.log1p(arr.std()))
-            ef[7] = float(s_pos.mean())
-            ef[8] = float(d_pos.mean())
-            ef[9] = float((d_pos - s_pos).mean())
+                ef[1:7] = [-1, -1, -1, -1, -1, 0]
         else:
-            if dataset.lower() == "hdfs" and hdfs_feature_contract == "notebook_raw_v1":
-                ef = np.array([float(len(s_pos))], dtype=np.float32)
-            else:
-                ef = np.array([float(np.log1p(len(s_pos)))], dtype=np.float32)
-
-        src_list.append(cid_to_idx[src])
-        dst_list.append(cid_to_idx[dst])
+            ef[0] = float(np.log1p(len(s_pos)))
+            if deltas:
+                arr = np.clip(np.array(deltas, dtype=np.float64), 0.0, None)
+                ef[1] = float(np.log1p(arr.min()))
+                ef[2] = float(np.log1p(np.percentile(arr, 25)))
+                ef[3] = float(np.log1p(np.median(arr)))
+                ef[4] = float(np.log1p(np.percentile(arr, 75)))
+                ef[5] = float(np.log1p(arr.max()))
+                ef[6] = float(np.log1p(arr.std()))
+        ef[7] = float(s_pos.mean())
+        ef[8] = float(d_pos.mean())
+        ef[9] = float((d_pos - s_pos).mean())
+        src_list.append(cid_to_idx[int(src)])
+        dst_list.append(cid_to_idx[int(dst)])
         edge_feats_list.append(ef)
 
-    x = torch.from_numpy(node_feats)
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     if edge_feats_list:
-        edge_feats_np = np.nan_to_num(
-            np.array(edge_feats_list, dtype=np.float32),
+        edge_index = np.asarray([src_list, dst_list], dtype=np.int64)
+        edge_attr = np.nan_to_num(
+            np.asarray(edge_feats_list, dtype=np.float32),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
     else:
-        edge_feats_np = np.zeros((0, edge_dim), dtype=np.float32)
-    edge_attr = torch.from_numpy(edge_feats_np)
-    y = torch.tensor([label], dtype=torch.long)
+        edge_index = np.zeros((2, 0), dtype=np.int64)
+        edge_attr = np.zeros((0, STRUCTURE_EDGE_DIM), dtype=np.float32)
 
-    kwargs = {id_col: seq_id, "num_nodes": num_nodes}
-    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, **kwargs)
+    return {
+        "cluster_ids": np.asarray(unique_cids, dtype=np.int64),
+        "node_extra": node_extra,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "y": int(label),
+        "id_col": id_col,
+        "seq_id": seq_id,
+        "num_nodes": num_nodes,
+    }
+
+
+def _node_features_from_structure(
+    structure: dict[str, Any],
+    cluster_embeddings: dict[int, np.ndarray],
+    embed_dim: int,
+    missing_embedding: Literal["zero", "fail"],
+) -> np.ndarray:
+    cluster_ids = [int(cid) for cid in structure["cluster_ids"]]
+    num_nodes = len(cluster_ids)
+    node_feats = np.zeros((num_nodes, embed_dim + NODE_EXTRA_DIM), dtype=np.float32)
+    for idx, cid in enumerate(cluster_ids):
+        if cid not in cluster_embeddings:
+            if missing_embedding == "fail":
+                raise MissingClusterEmbedding(cid)
+            emb = np.zeros(embed_dim, dtype=np.float32)
+        else:
+            emb = np.asarray(cluster_embeddings[cid], dtype=np.float32)
+        node_feats[idx, :embed_dim] = emb
+    node_feats[:, embed_dim:] = structure["node_extra"]
+    return np.nan_to_num(node_feats, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _seq_to_pyg(
+    seq: pd.DataFrame,
+    label: int,
+    cluster_embeddings: dict,
+    *,
+    embed_dim: int,
+    node_dim: int,
+    edge_dim: int,
+    use_edge_features: bool,
+    dataset: str,
+    missing_embedding: Literal["zero", "fail"] = "zero",
+    hdfs_feature_contract: HdfsFeatureContract = "stabilized_v2",
+):
+    """Convert a single sequence DataFrame to a PyG Data object."""
+    del node_dim, edge_dim  # derived from embeddings + cached 10-d structure
+    structure = _seq_to_structure(
+        seq,
+        label,
+        dataset=dataset,
+        hdfs_feature_contract=hdfs_feature_contract,
+    )
+    return attach_cluster_embeddings(
+        [structure],
+        cluster_embeddings,
+        use_edge_features=use_edge_features,
+        missing_embedding=missing_embedding,
+    )[0]

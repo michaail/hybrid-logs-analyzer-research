@@ -18,6 +18,7 @@ Public API
 ----------
     build_collapsed_graph(seq, cluster_to_template, *, use_edge_features) → nx.DiGraph
     sequence_fingerprint(seq)                                               → str
+    select_unique_sequences(sequences, labels)                              → (dict, dict, dict)
 """
 
 from __future__ import annotations
@@ -179,6 +180,54 @@ def sequence_fingerprint(seq: pd.DataFrame) -> str:
     cids = seq["cluster_id"].tolist()
     key = "|".join(str(c) for c in cids)
     return hashlib.md5(key.encode()).hexdigest()  # noqa: S324 — not security-sensitive
+
+
+def select_unique_sequences(
+    sequences: dict,
+    labels: dict,
+) -> tuple[dict, dict, dict[str, int]]:
+    """Keep one sequence per ordered-template fingerprint (and label, if mixed).
+
+    The representative for each ``(fingerprint, label)`` pair is the first
+    sequence id in sorted string order. Fingerprints that appear with both
+    normal and anomalous labels keep one example of each class.
+
+    Returns
+    -------
+    unique_sequences, unique_labels, stats
+        ``stats`` has ``n_raw``, ``n_unique``, and ``n_mixed_label_fingerprints``.
+    """
+    grouped: dict[str, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    for sequence_id in sorted(sequences, key=lambda sid: str(sid)):
+        fingerprint = sequence_fingerprint(sequences[sequence_id])
+        label = int(labels.get(sequence_id, 0))
+        grouped[fingerprint][label].append(sequence_id)
+
+    selected_ids: list = []
+    n_mixed = 0
+    for by_label in grouped.values():
+        if len(by_label) > 1:
+            n_mixed += 1
+        for label in sorted(by_label):
+            selected_ids.append(by_label[label][0])
+
+    selected_ids.sort(key=lambda sid: str(sid))
+    unique_sequences = {sequence_id: sequences[sequence_id] for sequence_id in selected_ids}
+    unique_labels = {
+        sequence_id: int(labels.get(sequence_id, 0)) for sequence_id in selected_ids
+    }
+    stats = {
+        "n_raw": len(sequences),
+        "n_unique": len(unique_sequences),
+        "n_mixed_label_fingerprints": n_mixed,
+    }
+    logger.info(
+        "Unique sequences: %d / %d raw  (%d mixed-label fingerprints)",
+        stats["n_unique"],
+        stats["n_raw"],
+        stats["n_mixed_label_fingerprints"],
+    )
+    return unique_sequences, unique_labels, stats
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

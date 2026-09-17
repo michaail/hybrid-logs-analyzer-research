@@ -148,13 +148,25 @@ class ArtifactStore:
             # A concurrent process might have completed the same stage first.
             existing = self._read_valid_manifest(manifest_path, stage_fingerprint)
             if existing is None:
-                os.replace(temp_dir, final_dir)
+                self._publish_stage_dir(temp_dir, final_dir)
                 temp_dir_to_cleanup = None  # ownership transferred to the final cache entry
                 return self._outputs_from_manifest(final_dir, manifest), manifest, False
             return self._outputs_from_manifest(final_dir, existing), existing, True
         finally:
             if temp_dir_to_cleanup is not None:
                 shutil.rmtree(temp_dir_to_cleanup, ignore_errors=True)
+
+    @staticmethod
+    def _publish_stage_dir(temp_dir: Path, final_dir: Path) -> None:
+        """Atomically move *temp_dir* to *final_dir*.
+
+        macOS ``os.replace`` cannot overwrite a non-empty destination (errno 66).
+        Finder often leaves an otherwise-empty fingerprint directory with only
+        ``.DS_Store``, which would otherwise fail after a successful rebuild.
+        """
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        os.replace(temp_dir, final_dir)
 
     @staticmethod
     def _read_valid_manifest(path: Path, stage_fingerprint: str) -> dict[str, Any] | None:
