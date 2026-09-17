@@ -1,10 +1,9 @@
-# Family A — representation ablations.
-# Each arm changes embeddings or graph tensors and MUST rebuild graph_dataset.pt
-# locally, then train-only on Colab with that bundle. Never pair this matrix with
-# a single shared --graph-dataset.
+# Family A — BGL representation ablations.
+# Same knobs as HDFS Family A except feature_contract_stabilized_v2 (HDFS-only
+# node encoding; on BGL it would duplicate baseline_full).
 #
 # Launch:
-#   python scripts/prepare_hdfs_campaign.py --campaign-id <id> ...
+#   python scripts/prepare_bgl_campaign.py --campaign-id <id> ...
 #   python run_ablation.py --mode train-only --campaign-dir <campaign> --family A
 family: representation
 requires_graph_rebuild: true
@@ -67,8 +66,7 @@ experiments:
       ablation.graph.use_edge_features: false
       ablation.feature_contract: notebook_raw_v1
 
-  # Small LLM is not a valid arm (unusable responses). This is TF-IDF only:
-  # no LLM text, no SBERT — same knobs as tfidf_only.
+  # TF-IDF only: no LLM text, no SBERT — same knobs as tfidf_only.
   - name: no_enrichment
     enabled: true
     requires_graph_rebuild: true
@@ -79,15 +77,3 @@ experiments:
       ablation.embeddings.sbert_enabled: false
       ablation.graph.use_edge_features: true
       ablation.feature_contract: notebook_raw_v1
-
-  - name: feature_contract_stabilized_v2
-    enabled: true
-    requires_graph_rebuild: true
-    overrides:
-      experiment.name: feature_contract_stabilized_v2
-      ablation.llm_enrichment_enabled: true
-      ablation.enrichment_model_size: large
-      ablation.embeddings.tfidf_enabled: true
-      ablation.embeddings.sbert_enabled: true
-      ablation.graph.use_edge_features: true
-      ablation.feature_contract: stabilized_v2

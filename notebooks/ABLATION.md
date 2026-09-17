@@ -1,6 +1,6 @@
-# HDFS ablation campaign
+# HDFS / BGL ablation campaign
 
-End-to-end protocol: **preprocess locally**, **train/eval on Colab**, keep a comparable artifact pack for every configuration.
+End-to-end protocol: **preprocess HDFS locally**, **train/eval on Colab**. BGL graphs may be prepared locally or in [`7_AblationStudy_BGL_Colab.ipynb`](./7_AblationStudy_BGL_Colab.ipynb) (`RUN_PREPARE=True`). Keep a comparable artifact pack for every configuration.
 
 This file is the operational contract. Implementation lives in this repository (`run_ablation.py`, `configs/ablation_*.yaml`, `src/modules/ablation.py`).
 
@@ -8,7 +8,8 @@ This file is the operational contract. Implementation lives in this repository (
 
 | Family | YAML | Rebuild `graph_dataset.pt`? | Colab mode |
 |---|---|---|---|
-| **A — representation** | `configs/ablation_representation.yaml` | Yes | `--mode train-only --family A --campaign-dir …` |
+| **A — representation (HDFS)** | `configs/ablation_representation.yaml` | Yes | `--mode train-only --family A --campaign-dir …` |
+| **A — representation (BGL)** | `configs/ablation_representation_bgl.yaml` | Yes | same, BGL campaign dir |
 | **B — train / architecture** | `configs/ablation_train.yaml` | No | `--mode train-only --family B` on `baseline_full` |
 
 `configs/ablation_matrix.yaml` is deprecated. It now re-exports Family B only so an accidental shared-graph `train-only` run cannot fake a TF-IDF vs SBERT ablation.
@@ -19,8 +20,9 @@ Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT,
 
 - One Drain parse, one HDFS block sequencing, **one split lock** (`split_lock.npz`) shared by every Family A graph.
 - Seed 42, clean-train, val-F1 threshold, report test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
+- LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Mistral large/small are not ablation arms.
 - Default `ablation.feature_contract: notebook_raw_v1` (thesis-comparable). `stabilized_v2` is an explicit Family A arm.
-- Do not recompute SBERT on Colab (local ST 2.2.2 vs Colab ST 5.x). Train-only consumes frozen tensors.
+- Do not mix sentence-transformers versions inside one dataset campaign. HDFS stays local (ST 2.2.2). A BGL campaign is either fully local (ST 2.2.2) or fully Colab-prepared (ST 5.x via `RUN_PREPARE`). Train-only consumes frozen tensors.
 - Never train from the Drive mount. Stage `.pt.gz` → `/content/workspace`, decompress there.
 - Pin `GIT_REF` for the Colab clone; do not `git pull` mid-campaign. Cache fingerprints no longer include git SHA (SHA still lands on run manifests).
 
@@ -43,6 +45,8 @@ python run_ablation.py --mode prepare-campaign \
   --workspace-root /path/to/workspace \
   --set experiment.dataset=hdfs
 ```
+
+Raw log and labels: `data/raw/hdfs/HDFS_full.log` and `data/raw/hdfs/anomaly_label.csv` (via the `data/` symlink into the sibling project repo).
 
 Writes `campaigns/<id>/`:
 
@@ -67,7 +71,7 @@ python scripts/drive_sync.py push \
 
 ## Colab train / eval
 
-1. Open [`7_AblationStudy_Colab.ipynb`](./7_AblationStudy_Colab.ipynb) (clones this repository).
+1. Open [`7_AblationStudy_Colab.ipynb`](./7_AblationStudy_Colab.ipynb) for HDFS, or [`7_AblationStudy_BGL_Colab.ipynb`](./7_AblationStudy_BGL_Colab.ipynb) for BGL (clones this repository).
 2. Set `CAMPAIGN_ID`, `FAMILY`, `GIT_REF` (campaign branch), `SMOKE=True` first.
 3. Family B can start as soon as `graphs/baseline_full/graph_dataset.pt.gz` is on Drive.
 4. Family A stages the whole campaign dir; the CLI unpacks **one** graph at a time.
@@ -94,13 +98,43 @@ hybrid-log-analyzer-artifacts/
   campaigns/<id>/graphs/<arm>/graph_dataset.pt.gz
   outputs/hdfs/<campaign_id>_<arm>/
   outputs/hdfs/campaigns/<id>/
-  artifacts/cache/hdfs/          # resumable stage cache
+  outputs/bgl/<campaign_id>_<arm>/
+  outputs/bgl/campaigns/<id>/
+  artifacts/cache/hdfs/
+  artifacts/cache/bgl/
   artifacts/runs/
 ```
 
 ## BGL
 
-Out of scope for campaign 1 (path and sequence-filename mismatches). Reuse this two-family protocol after those are fixed; window/step changes are Family A (rebuild), not train-only.
+Same two-family protocol as HDFS. Graphs are 20 min / 10 min windows. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
+
+```bash
+python scripts/prepare_bgl_campaign.py \
+  --campaign-id bgl_ablation_20260917 \
+  --workspace-root /path/to/workspace
+```
+
+Equivalent:
+
+```bash
+python run_ablation.py --mode prepare-campaign \
+  --campaign-id bgl_ablation_20260917 \
+  --workspace-root /path/to/workspace \
+  --set experiment.dataset=bgl \
+  --matrix configs/ablation_representation_bgl.yaml
+```
+
+Raw log: `data/raw/bgl/BGL_full.log`. You can prepare **locally** (`prepare_bgl_campaign.py`) or **on Colab** via [`7_AblationStudy_BGL_Colab.ipynb`](./7_AblationStudy_BGL_Colab.ipynb) (`RUN_PREPARE=True`). Colab prepare uses sentence-transformers 5.x — do not mix those graphs with a local BGL campaign (ST 2.2.2).
+
+Colab prepare needs:
+
+- Drive: `MyDrive/hybrid-log-analyzer-artifacts/data/raw/bgl/BGL_full.log`
+- Secrets: `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`
+
+Then set `RUN_TRAIN=True` for Family B / A. Rank by PR-AUC under `outputs/bgl/campaigns/<id>/`.
+
+Window/step changes would be extra Family A rebuilds, not train-only. Single-graph debug: [`6_GAE_Training_BGL_Colab.ipynb`](./6_GAE_Training_BGL_Colab.ipynb).
 
 ## Off the critical path
 

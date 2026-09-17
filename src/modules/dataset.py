@@ -39,6 +39,18 @@ class MissingClusterEmbedding(ValueError):
         super().__init__(f"Cluster {cluster_id} has no frozen embedding.")
 
 
+def _require_torch_geometric() -> None:
+    """Fail before the per-sequence loop if PyG is missing from this venv."""
+    try:
+        import torch_geometric  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "torch_geometric is required to build graph_dataset.pt. "
+            "This repository venv needs the same PyG as the local Torch 2.2.2 "
+            "baseline: pip install torch-geometric==2.3.0"
+        ) from exc
+
+
 # ── Embedding computation ─────────────────────────────────────────────────────
 
 
@@ -166,6 +178,7 @@ def build_pyg_dataset(
     -------
     list[torch_geometric.data.Data]
     """
+    _require_torch_geometric()
     embed_dim = next(iter(cluster_embeddings.values())).shape[0]
     node_extra_dim = 9
     node_dim = embed_dim + node_extra_dim
@@ -198,6 +211,8 @@ def build_pyg_dataset(
             )
             all_data.append(data)
         except MissingClusterEmbedding:
+            raise
+        except ModuleNotFoundError:
             raise
         except Exception as exc:
             if on_graph_error == "fail":

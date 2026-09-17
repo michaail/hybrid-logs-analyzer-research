@@ -1,0 +1,15 @@
+{
+  "template_id": "30",
+  "template": "WARN dfs.DataNode$DataXceiver: <IP>:Got exception while serving <BLK> to /<IP>:",
+  "occurrence_count": 356207,
+  "examples": [
+    "081109 213849 2471 WARN dfs.DataNode$DataXceiver: 10.251.71.68:50010:Got exception while serving blk_-8781759536960110370 to /10.250.17.225:",
+    "081109 213849 2511 WARN dfs.DataNode$DataXceiver: 10.251.27.63:50010:Got exception while serving blk_1732876454483854279 to /10.251.27.63:",
+    "081109 213850 2450 WARN dfs.DataNode$DataXceiver: 10.251.203.166:50010:Got exception while serving blk_-933600745359216493 to /10.251.91.229:",
+    "081109 213850 2460 WARN dfs.DataNode$DataXceiver: 10.251.107.227:50010:Got exception while serving blk_-1886154032861725764 to /10.250.11.100:",
+    "081109 213850 2464 WARN dfs.DataNode$DataXceiver: 10.250.15.198:50010:Got exception while serving blk_7732760914518898593 to /10.250.15.198:"
+  ],
+  "candidate_relations": [],
+  "retrieved_docs": [],
+  "dataset_context": "HDFS-v1 labels apply to complete traces grouped by block ID, not to an individual log event or template."
+}

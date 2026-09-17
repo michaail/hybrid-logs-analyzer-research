@@ -54,7 +54,7 @@ def test_family_yaml_files_are_split() -> None:
     assert representation["family"] == "representation"
     assert representation["requires_graph_rebuild"] is True
     names_a = {item["name"] for item in enabled_experiments(representation)}
-    assert {"baseline_full", "tfidf_only", "no_llm_enrichment", "enrichment_small"} <= names_a
+    assert {"baseline_full", "tfidf_only", "no_llm_enrichment", "no_enrichment"} <= names_a
     assert all(experiment_requires_graph_rebuild(item, representation) for item in enabled_experiments(representation))
     names_b = {item["name"] for item in enabled_experiments(train)}
     assert {"alpha_0", "gine_mean_agg", "latent_32"} <= names_b
@@ -62,6 +62,43 @@ def test_family_yaml_files_are_split() -> None:
     mixed_names = {item["name"] for item in enabled_experiments(mixed)}
     assert "tfidf_only" not in mixed_names
     assert mixed["requires_graph_rebuild"] is False
+
+
+def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
+    bgl = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_representation_bgl.yaml")
+    assert bgl["family"] == "representation"
+    names = {item["name"] for item in enabled_experiments(bgl)}
+    assert "feature_contract_stabilized_v2" not in names
+    assert {"baseline_full", "tfidf_only", "no_llm_enrichment", "no_enrichment", "sbert_only", "no_edge_features"} <= names
+    assert all(experiment_requires_graph_rebuild(item, bgl) for item in enabled_experiments(bgl))
+    base = yaml.safe_load((REPOSITORY_ROOT / "configs" / "ablation_base.yaml").read_text())
+    assert base["parser"]["hdfs"]["raw_file"] == "hdfs/HDFS_full.log"
+    assert base["parser"]["bgl"]["raw_file"] == "bgl/BGL_full.log"
+    prepare_hdfs = (REPOSITORY_ROOT / "scripts" / "prepare_hdfs_campaign.py").read_text()
+    assert "parser.hdfs.raw_file=hdfs/HDFS_full.log" in prepare_hdfs
+    assert "ablation.enrichment_model_size=large" in prepare_hdfs
+    prepare = (REPOSITORY_ROOT / "scripts" / "prepare_bgl_campaign.py").read_text()
+    assert "experiment.dataset=bgl" in prepare
+    assert "ablation_representation_bgl.yaml" in prepare
+    assert "ablation.enrichment_model_size=large" in prepare
+    run_ablation_src = (REPOSITORY_ROOT / "run_ablation.py").read_text()
+    assert 'else "both"' not in run_ablation_src
+    assert "deepseek-v4-pro" in run_ablation_src
+    enrichment_src = (REPOSITORY_ROOT / "src" / "modules" / "enrichment.py").read_text()
+    assert "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO" in enrichment_src
+    assert "AZURE_OPENAI_DEPLOYMENT_MISTRAL_LARGE" not in enrichment_src
+    assert "AZURE_OPENAI_DEPLOYMENT_MISTRAL_SMALL" not in enrichment_src
+    llm_src = (REPOSITORY_ROOT / "src" / "modules" / "enricher" / "llm.py").read_text()
+    assert "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO" in llm_src
+
+
+def test_enrichment_rejects_small_and_both_models() -> None:
+    from src.modules.enrichment import enrich_templates
+
+    with pytest.raises(ValueError, match="Deepseek"):
+        enrich_templates([{"template": "x", "cluster_id": 0}], "hdfs", model_size="small")
+    with pytest.raises(ValueError, match="Deepseek"):
+        enrich_templates([{"template": "x", "cluster_id": 0}], "hdfs", model_size="both")
 
 
 def test_feature_contract_defaults_to_notebook_raw() -> None:

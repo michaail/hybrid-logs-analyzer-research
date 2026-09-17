@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Prepare a local HDFS Family A ablation campaign (parse → gzipped graphs).
+"""Prepare a BGL Family A ablation campaign (parse → gzipped graphs).
 
-Run from this repository root. Training stays on Colab via
-``run_ablation.py --mode train-only``.
+Run from this repository root or from ``7_AblationStudy_BGL_Colab.ipynb``
+(``RUN_PREPARE=True``). Training is a separate ``--mode train-only`` step.
+Enrichment uses the large model only.
 
 Example::
 
-    python scripts/prepare_hdfs_campaign.py \\
-        --campaign-id hdfs_ablation_20260916 \\
+    python scripts/prepare_bgl_campaign.py \\
+        --campaign-id bgl_ablation_20260917 \\
         --workspace-root /path/to/workspace
 """
 
@@ -43,7 +44,7 @@ def main() -> int:
     parser.add_argument(
         "--matrix",
         type=Path,
-        default=ROOT / "configs" / "ablation_representation.yaml",
+        default=ROOT / "configs" / "ablation_representation_bgl.yaml",
     )
     parser.add_argument("--campaign-dir", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
@@ -60,8 +61,8 @@ def main() -> int:
     config = run_ablation.apply_overrides(
         config,
         [
-            "experiment.dataset=hdfs",
-            "parser.hdfs.raw_file=hdfs/HDFS_full.log",
+            "experiment.dataset=bgl",
+            "parser.bgl.raw_file=bgl/BGL_full.log",
             "ablation.enrichment_model_size=large",
             *args.overrides,
         ],

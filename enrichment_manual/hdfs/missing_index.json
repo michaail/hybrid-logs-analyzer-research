@@ -1,0 +1,9 @@
+[
+  {
+    "cluster_id": 30,
+    "template": "WARN dfs.DataNode$DataXceiver: <IP>:Got exception while serving <BLK> to /<IP>:",
+    "problem": "missing enriched_large",
+    "prompt": "/Users/michalklos/Magisterka 2026/Repository/hybrid-logs-analyzer-research/enrichment_manual/hdfs/cluster_30/prompt.txt",
+    "response": "/Users/michalklos/Magisterka 2026/Repository/hybrid-logs-analyzer-research/enrichment_manual/hdfs/cluster_30/response.json"
+  }
+]

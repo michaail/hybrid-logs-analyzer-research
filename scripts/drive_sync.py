@@ -18,15 +18,18 @@ from pathlib import Path
 DATASET_FILTERS = {
     "bgl": [
         "data/raw/BGL_full.log",
+        "data/raw/bgl/**",
         "data/processed/bgl/**",
         "data/processed/BGL/**",
         "artifacts/cache/bgl/**",
         "outputs/bgl/**",
         "artifacts/runs/**",
+        "campaigns/**",
     ],
     "hdfs": [
         "data/raw/HDFS_full.log",
         "data/raw/anomaly_label.csv",
+        "data/raw/hdfs/**",
         "data/processed/hdfs/**",
         "artifacts/cache/hdfs/**",
         "outputs/hdfs/**",

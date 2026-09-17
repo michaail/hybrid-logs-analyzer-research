@@ -54,6 +54,7 @@ from src.modules.ablation import (
 )
 from src.modules.artifacts import SUCCESS_FILE, ArtifactStore, fingerprint, git_revision, input_metadata
 from src.modules.dataset import (
+    _require_torch_geometric,
     build_pyg_dataset,
     compute_embeddings,
     save_graph_dataset,
@@ -146,7 +147,8 @@ def stage2_enrich(
     stage_config = {
         "dataset": dataset,
         "llm_enrichment_enabled": bool(ablation["llm_enrichment_enabled"]),
-        "enrichment_model_size": ablation["enrichment_model_size"],
+        "enrichment_model_size": "large" if ablation["llm_enrichment_enabled"] else ablation["enrichment_model_size"],
+        "enrichment_backend": "deepseek-v4-pro" if ablation["llm_enrichment_enabled"] else None,
     }
 
     def build(temp_dir: Path) -> dict[str, Path]:
@@ -154,12 +156,7 @@ def stage2_enrich(
         with stage1["templates"].open() as handle:
             templates = json.load(handle)
         if ablation["llm_enrichment_enabled"]:
-            model_size = str(ablation["enrichment_model_size"])
-            if model_size == "both":
-                enrich_templates(templates, dataset, model_size="large")
-                enrich_templates(templates, dataset, model_size="small")
-            else:
-                enrich_templates(templates, dataset, model_size=model_size)
+            enrich_templates(templates, dataset, model_size="large")
         destination.write_text(json.dumps(templates, indent=2))
         return {"templates": destination}
 
@@ -224,8 +221,7 @@ def stage45_build_dataset(
     dataset = _dataset(config)
     templates_path = Path(templates_path).resolve()
     sequences_path = Path(sequences_path).resolve()
-    raw_dir = workspace / config["paths"]["raw_dir"]
-    labels_path = raw_dir / "anomaly_label.csv"
+    labels_path = _hdfs_labels_path(workspace, config)
     inputs = [templates_path, sequences_path]
     if dataset == "hdfs":
         inputs.append(labels_path)
@@ -270,6 +266,7 @@ def stage45_build_dataset(
             use_edge_features=bool(ablation["graph"]["use_edge_features"]),
             dataset=dataset,
             hdfs_feature_contract=feature_contract_from_config(config),  # type: ignore[arg-type]
+            on_graph_error="fail",
         )
         if not data_list:
             raise ValueError("Graph builder produced no examples.")
@@ -542,7 +539,7 @@ def resolve_hdfs_release_source(
     parser_settings = config["parser"][dataset]
     raw_path = workspace / config["paths"]["raw_dir"] / parser_settings["raw_file"]
     parser_config = code / parser_settings["config"]
-    labels_path = workspace / config["paths"]["raw_dir"] / "anomaly_label.csv"
+    labels_path = _hdfs_labels_path(workspace, config)
     stage1 = _require_completed_stage(
         store,
         stage="stage1_parse",
@@ -971,7 +968,7 @@ def _sequence_labels(
         }
     if labels_path is None or not labels_path.exists():
         raise FileNotFoundError(
-            "HDFS requires data/raw/anomaly_label.csv for reproducible labels."
+            "HDFS requires data/raw/hdfs/anomaly_label.csv for reproducible labels."
         )
     labels_frame = pd.read_csv(labels_path)
     columns = {column.lower(): column for column in labels_frame.columns}
@@ -1045,6 +1042,19 @@ def _dataset(config: dict[str, Any]) -> str:
     return dataset
 
 
+def _hdfs_labels_path(workspace: Path, config: dict[str, Any]) -> Path:
+    """Resolve LogHub labels next to the HDFS raw log, with a flat-path fallback."""
+    raw_dir = workspace / config["paths"]["raw_dir"]
+    raw_file = str(config.get("parser", {}).get("hdfs", {}).get("raw_file") or "hdfs/HDFS_full.log")
+    sibling = (raw_dir / raw_file).parent / "anomaly_label.csv"
+    flat = raw_dir / "anomaly_label.csv"
+    if sibling.exists():
+        return sibling
+    if flat.exists():
+        return flat
+    return sibling
+
+
 def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
     ablation = config["ablation"]
     return {
@@ -1054,6 +1064,7 @@ def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
         "use_edge_features": ablation["graph"]["use_edge_features"],
         "llm_enrichment_enabled": bool(ablation["llm_enrichment_enabled"]),
         "enrichment_model_size": ablation.get("enrichment_model_size"),
+        "enrichment_backend": "deepseek-v4-pro" if ablation.get("llm_enrichment_enabled") else None,
         "feature_contract": feature_contract_from_config(config),
     }
 
@@ -1149,7 +1160,7 @@ def _checkpoint_workspace(workspace: Path, checkpoint_root: str | Path | None) -
     destination_root = Path(checkpoint_root).resolve()
     if destination_root == workspace.resolve():
         return
-    for name in ("artifacts", "models", "outputs", "runs"):
+    for name in ("artifacts", "models", "outputs", "runs", "campaigns"):
         source = workspace / name
         if not source.exists():
             continue
@@ -1241,23 +1252,47 @@ def prepare_representation_campaign(
         workspace / "campaigns" / campaign_id
     )
     destination.mkdir(parents=True, exist_ok=True)
-    matrix_file = Path(matrix_path).resolve() if matrix_path else (
-        code / "configs" / "ablation_representation.yaml"
-    )
+    if matrix_path:
+        matrix_file = Path(matrix_path).resolve()
+    elif dataset == "bgl":
+        matrix_file = code / "configs" / "ablation_representation_bgl.yaml"
+    else:
+        matrix_file = code / "configs" / "ablation_representation.yaml"
     matrix = load_matrix(matrix_file)
     experiments = enabled_experiments(matrix)
+    _require_torch_geometric()
+    print("[CAMPAIGN] enrichment backend: deepseek-v4-pro")
 
-    enrich_config = apply_overrides(config, ["ablation.enrichment_model_size=both"])
-    stage1_parse(enrich_config, campaign_id, workspace_root=workspace, code_root=code)
-    _checkpoint_workspace(workspace, checkpoint_root)
-    templates = stage2_enrich(
-        enrich_config, campaign_id, workspace_root=workspace, code_root=code
-    )
-    _checkpoint_workspace(workspace, checkpoint_root)
-    sequences = stage3_sequence(
-        enrich_config, campaign_id, workspace_root=workspace, code_root=code
-    )
-    _checkpoint_workspace(workspace, checkpoint_root)
+    def _arm_bundle_complete(arm_name: str) -> bool:
+        bundle = destination / "graphs" / arm_name
+        return (bundle / "graph_dataset.pt.gz").exists() and (bundle / "dataset_meta.json").exists()
+
+    pending = [
+        _safe_name(str(item["name"]))
+        for item in experiments
+        if not _arm_bundle_complete(_safe_name(str(item["name"])))
+    ]
+    for item in experiments:
+        name = _safe_name(str(item["name"]))
+        status = "pending" if name in pending else "reuse"
+        print(f"[CAMPAIGN] {name}: {status}")
+
+    templates: Path | None = None
+    sequences: Path | None = None
+    if pending:
+        enrich_config = apply_overrides(config, ["ablation.enrichment_model_size=large"])
+        stage1_parse(enrich_config, campaign_id, workspace_root=workspace, code_root=code)
+        _checkpoint_workspace(workspace, checkpoint_root)
+        templates = stage2_enrich(
+            enrich_config, campaign_id, workspace_root=workspace, code_root=code
+        )
+        _checkpoint_workspace(workspace, checkpoint_root)
+        sequences = stage3_sequence(
+            enrich_config, campaign_id, workspace_root=workspace, code_root=code
+        )
+        _checkpoint_workspace(workspace, checkpoint_root)
+    else:
+        print("[CAMPAIGN] all graph bundles present; skipping parse/enrich/sequence/rebuild")
 
     split_lock_path = destination / "split_lock.npz"
     graphs: list[dict[str, Any]] = []
@@ -1271,6 +1306,27 @@ def prepare_representation_campaign(
         )
         arm_config["experiment"]["campaign_id"] = campaign_id
         arm_config["experiment"]["family"] = "representation"
+        bundle_dir = destination / "graphs" / name
+        existing = bundle_dir / "graph_dataset.pt.gz"
+        existing_meta = bundle_dir / "dataset_meta.json"
+        if existing.exists() and existing_meta.exists():
+            graphs.append(
+                {
+                    "name": name,
+                    "graph_dataset": str(existing.relative_to(destination)),
+                    "dataset_meta": "graphs/" + name + "/dataset_meta.json",
+                    "identity": graph_identity_from_config(arm_config),
+                    "digest": file_digest(existing),
+                    "node_dim": json.loads(existing_meta.read_text()).get("node_dim"),
+                    "reused": True,
+                }
+            )
+            print(f"[CAMPAIGN] {name} already present → {existing}")
+            continue
+        if templates is None or sequences is None:
+            raise RuntimeError(
+                f"Cannot rebuild {name}: parse/enrich/sequence artifacts are missing."
+            )
         graph_path = stage45_build_dataset(
             arm_config,
             f"{campaign_id}_{name}",

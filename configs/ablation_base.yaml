@@ -14,10 +14,10 @@ paths:
 
 parser:
   hdfs:
-    raw_file: HDFS_full.log
+    raw_file: hdfs/HDFS_full.log
     config: configs/drain.ini
   bgl:
-    raw_file: BGL_full.log
+    raw_file: bgl/BGL_full.log
     config: configs/drain_bgl.ini
 
 sequencing:
@@ -27,7 +27,7 @@ sequencing:
 
 ablation:
   llm_enrichment_enabled: true
-  enrichment_model_size: large
+  enrichment_model_size: large  # Deepseek v4 Pro; small/both are not used
   # Thesis-comparable HDFS graphs use the original notebook feature encoding.
   # Set stabilized_v2 only as an explicit Family A arm.
   feature_contract: notebook_raw_v1

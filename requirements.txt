@@ -1,6 +1,6 @@
-# Local pipeline dependencies. PyTorch and torch-geometric are omitted:
-# install those from the Intel Mac lockfile in hybrid-logs-analyzer, or let
-# Colab supply CUDA Torch and scripts/install_colab.py add matching PyG wheels.
+# Local pipeline dependencies. PyTorch is omitted (install the Intel Mac 2.2.2
+# wheel). Local prepare also needs PyG in the same venv:
+#   pip install torch-geometric==2.3.0
 #
 # Do not install requirements-colab.txt on the Intel Mac baseline (ST 5.x vs 2.2.2).
 drain3==0.9.11

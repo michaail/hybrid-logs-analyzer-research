@@ -26,11 +26,13 @@ def enrich_templates(
     ----------
     templates_data:
         List of dicts with at least a ``"template"`` key (output of the parser
-        stage).  Adds ``"enriched_large"`` or ``"enriched_small"`` keys in-place.
+        stage).  Adds ``"enriched_large"`` (Deepseek v4 Pro) in-place.
     dataset:
         ``"hdfs"`` or ``"bgl"`` — selects the enrichment prompt.
     model_size:
-        ``"large"`` or ``"small"`` — selects the Azure deployment.
+        Kept for cache/identity compatibility. Ablation enrichment always uses
+        Azure ``AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`` and stores the result
+        in ``enriched_large``. ``small`` / ``both`` are not valid arms.
 
     Returns
     -------
@@ -39,11 +41,12 @@ def enrich_templates(
     """
     from src.modules.enricher import Enricher, TemplateContext  # optional dependency
 
-    deployment_env = (
-        "AZURE_OPENAI_DEPLOYMENT_MISTRAL_LARGE"
-        if model_size == "large"
-        else "AZURE_OPENAI_DEPLOYMENT_MISTRAL_SMALL"
-    )
+    if model_size in {"small", "both"}:
+        raise ValueError(
+            "Ablation enrichment uses Deepseek v4 Pro only; "
+            f"model_size={model_size!r} is not supported."
+        )
+    deployment_env = "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO"
     deployment = os.getenv(deployment_env)
     if not deployment:
         raise EnvironmentError(
@@ -52,7 +55,7 @@ def enrich_templates(
         )
 
     enricher = Enricher(deployment)
-    field = f"enriched_{model_size}"
+    field = "enriched_large"
 
     for i, entry in enumerate(templates_data):
         template = entry["template"]
