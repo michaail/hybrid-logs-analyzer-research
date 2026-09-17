@@ -19,6 +19,7 @@ DATASET_FILTERS = {
     "bgl": [
         "data/raw/BGL_full.log",
         "data/processed/bgl/**",
+        "data/processed/BGL/**",
         "artifacts/cache/bgl/**",
         "outputs/bgl/**",
         "artifacts/runs/**",
