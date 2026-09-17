@@ -23,7 +23,9 @@ parser:
 sequencing:
   bgl:
     window_minutes: 20
-    step_minutes: 10
+    # Keep windows disjoint: the graph split is stratified at window level, so
+    # overlapping windows would copy log records across train/val/test.
+    step_minutes: 20
 
 ablation:
   llm_enrichment_enabled: true

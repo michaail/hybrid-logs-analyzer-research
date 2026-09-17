@@ -107,7 +107,9 @@ hybrid-log-analyzer-artifacts/
 
 ## BGL
 
-Same two-family protocol as HDFS. Graphs are 20 min / 10 min windows. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
+Same two-family protocol as HDFS. Graphs are disjoint 20-minute windows. Do not use overlapping windows with the random stratified graph split: adjacent windows would share raw log records across train, validation, and test. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
+
+Published campaign metrics require `SMOKE=False` (25 epochs and complete splits). A smoke run uses one epoch and at most 5,000 graphs per split and is only a pipeline diagnostic. Use a new campaign ID when replacing an already published smoke campaign.
 
 ```bash
 python scripts/prepare_bgl_campaign.py \

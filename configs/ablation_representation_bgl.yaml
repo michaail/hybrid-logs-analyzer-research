@@ -66,14 +66,3 @@ experiments:
       ablation.graph.use_edge_features: false
       ablation.feature_contract: notebook_raw_v1
 
-  # TF-IDF only: no LLM text, no SBERT — same knobs as tfidf_only.
-  - name: no_enrichment
-    enabled: true
-    requires_graph_rebuild: true
-    overrides:
-      experiment.name: no_enrichment
-      ablation.llm_enrichment_enabled: false
-      ablation.embeddings.tfidf_enabled: true
-      ablation.embeddings.sbert_enabled: false
-      ablation.graph.use_edge_features: true
-      ablation.feature_contract: notebook_raw_v1

@@ -1387,9 +1387,25 @@ def prepare_representation_campaign(
     return json.loads(manifest_path.read_text())
 
 
-def _completed_run_dir(workspace: Path, dataset: str, run_id: str) -> Path | None:
+def _completed_run_dir(
+    workspace: Path,
+    dataset: str,
+    run_id: str,
+    *,
+    expected_config: dict[str, Any],
+) -> Path | None:
+    """Return a compatible completed run, never a stale smoke/config result."""
     metrics = workspace / "outputs" / dataset / run_id / "metrics.json"
-    return metrics.parent if metrics.exists() else None
+    config_path = metrics.parent / "config.yaml"
+    if not metrics.exists() or not config_path.exists():
+        return None
+    try:
+        completed_config = yaml.safe_load(config_path.read_text())
+        if _stage6_config(completed_config) != _stage6_config(expected_config):
+            return None
+    except (KeyError, TypeError, yaml.YAMLError):
+        return None
+    return metrics.parent
 
 
 def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
@@ -1426,7 +1442,9 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
         config["experiment"]["family"] = matrix.get("family") or config["experiment"].get("family")
         config["experiment"]["name"] = name
         run_id = get_run_tag(config)
-        existing = _completed_run_dir(workspace, dataset, run_id)
+        existing = _completed_run_dir(
+            workspace, dataset, run_id, expected_config=config
+        )
         if existing is not None:
             metrics = json.loads((existing / "metrics.json").read_text())
             results.append({"name": name, "status": "OK", "reused": True, **metrics})
@@ -1498,12 +1516,6 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
         for graph_entry in manifest.get("graphs") or []:
             name = graph_entry["name"]
             run_id = f"{_safe_name(campaign_id)}_{_safe_name(name)}"
-            existing = _completed_run_dir(workspace, dataset, run_id)
-            if existing is not None:
-                metrics = json.loads((existing / "metrics.json").read_text())
-                results.append({"name": name, "status": "OK", "reused": True, **metrics})
-                print(f"[SKIP] {name}")
-                continue
             overrides = [f"experiment.name={name}"]
             identity = graph_entry.get("identity") or {}
             if "llm_enrichment_enabled" in identity:
@@ -1535,6 +1547,14 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
             config["experiment"]["family"] = "representation"
             config["experiment"]["run_id"] = run_id
             config["experiment"]["name"] = name
+            existing = _completed_run_dir(
+                workspace, dataset, run_id, expected_config=config
+            )
+            if existing is not None:
+                metrics = json.loads((existing / "metrics.json").read_text())
+                results.append({"name": name, "status": "OK", "reused": True, **metrics})
+                print(f"[SKIP] {name}")
+                continue
             relative = graph_entry["graph_dataset"]
             compressed = campaign_dir / relative
             if not compressed.exists():
