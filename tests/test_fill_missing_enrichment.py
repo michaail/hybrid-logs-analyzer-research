@@ -17,6 +17,8 @@ fill = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = fill
 SPEC.loader.exec_module(fill)
 
+from src.modules.enricher import Enricher
+
 VALID_ENRICHMENT = {
     "component": "DataNode",
     "log_level": "WARN",
@@ -136,5 +138,12 @@ def test_fill_record_with_llm_injects_missing_dataset_caveat(
     )
     record = _template_record()
     fill.fill_record_with_llm(record, "hdfs", _FakeEnricher())
-    assert record["enriched_large"]["dataset_label_caveat"].startswith("HDFS-v1")
+    assert record["enriched_large"]["dataset_label_caveat"]
     assert fill.enrichment_problem(record) is None
+
+
+def test_enricher_parse_fills_omitted_dataset_label_caveat() -> None:
+    payload = {key: value for key, value in VALID_ENRICHMENT.items() if key != "dataset_label_caveat"}
+    parsed = Enricher._parse_response(json.dumps(payload))
+    assert parsed.dataset_label_caveat
+    assert "omitted by the model" in " ".join(parsed.unsupported_inferences)

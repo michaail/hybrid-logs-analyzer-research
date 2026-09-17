@@ -259,6 +259,11 @@ def stage45_build_dataset(
             cluster_id: embedding
             for cluster_id, embedding in zip(cluster_ids, embeddings, strict=True)
         }
+        print(
+            f"[GRAPH] building {len(sequences)} {dataset} graphs "
+            "(this can take a long time after the SBERT bar finishes)",
+            flush=True,
+        )
         data_list = build_pyg_dataset(
             sequences,
             labels,
@@ -270,6 +275,7 @@ def stage45_build_dataset(
         )
         if not data_list:
             raise ValueError("Graph builder produced no examples.")
+        print(f"[GRAPH] built {len(data_list)} graphs; splitting and saving", flush=True)
         sequence_ids = sequence_ids_from_graphs(data_list)
         if lock_path is not None:
             idx_train, idx_val, idx_test = apply_split_lock(

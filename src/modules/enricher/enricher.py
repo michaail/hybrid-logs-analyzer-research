@@ -129,6 +129,13 @@ class Enricher:
             unsupported.append(role_note)
         if has_enrichment_wrapper:
             unsupported.append("Provider returned a nested enrichment object; it was unwrapped.")
+        if not str(payload.get("dataset_label_caveat") or "").strip():
+            payload["dataset_label_caveat"] = (
+                "No event-level label information was supplied."
+            )
+            unsupported.append(
+                "dataset_label_caveat was omitted by the model; filled from the prompt fallback."
+            )
 
         return EnrichedTemplate.model_validate(payload)
 

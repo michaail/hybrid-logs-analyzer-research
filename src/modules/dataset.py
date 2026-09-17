@@ -194,7 +194,16 @@ def build_pyg_dataset(
                 if int(cluster_id) not in normalized_embeddings:
                     raise MissingClusterEmbedding(int(cluster_id))
 
-    for wid, seq in sequences.items():
+    from tqdm import tqdm
+
+    iterator = tqdm(
+        sequences.items(),
+        total=len(sequences),
+        desc="PyG graphs",
+        unit="seq",
+        mininterval=2.0,
+    )
+    for wid, seq in iterator:
         label = block_labels.get(wid, 0)
         try:
             data = _seq_to_pyg(
