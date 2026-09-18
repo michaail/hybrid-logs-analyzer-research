@@ -29,6 +29,7 @@ LEGACY_GRAPH_IDENTITY: dict[str, Any] = {
     "unique_sequences": False,
     "fit_on": "all",
     "split_protocol": "stratified",
+    "sbert_text": "embedding_text",
 }
 
 GRAPH_IDENTITY_KEYS = tuple(LEGACY_GRAPH_IDENTITY.keys())
@@ -95,6 +96,28 @@ def structure_decoder_from_config(config: Mapping[str, Any]) -> str:
     return value
 
 
+def sbert_text_from_config(config: Mapping[str, Any]) -> str:
+    """How MiniLM text is assembled. Missing YAML stays ``embedding_text``."""
+    embeddings = ((config.get("ablation") or {}).get("embeddings")) or {}
+    value = str(embeddings.get("sbert_text") or "embedding_text").lower()
+    if value not in {"embedding_text", "grounded_v1"}:
+        raise ValueError(
+            f"ablation.embeddings.sbert_text must be 'embedding_text' or 'grounded_v1', got {value!r}"
+        )
+    return value
+
+
+def node_reconstruct_from_config(config: Mapping[str, Any]) -> str:
+    """Node-decoder target: full ``x`` or TF-IDF+extras (skip SBERT)."""
+    fusion = ((config.get("ablation") or {}).get("fusion")) or {}
+    value = str(fusion.get("node_reconstruct") or "all").lower()
+    if value not in {"all", "without_sbert"}:
+        raise ValueError(
+            f"ablation.fusion.node_reconstruct must be 'all' or 'without_sbert', got {value!r}"
+        )
+    return value
+
+
 def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return the representation knobs that require a distinct graph bundle."""
     ablation = config["ablation"]
@@ -112,6 +135,7 @@ def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "unique_sequences": unique_sequences_from_config(config),
         "fit_on": fit_on_from_config(config),
         "split_protocol": split_protocol_from_config(config),
+        "sbert_text": sbert_text_from_config(config),
     }
 
 
@@ -145,6 +169,10 @@ def graph_identity_from_meta(meta: Mapping[str, Any] | None) -> dict[str, Any] |
             "unique_sequences": _unique_sequences_from_meta(meta),
             "fit_on": str(_identity_field_from_meta(meta, "fit_on", "all")),
             "split_protocol": str(_identity_field_from_meta(meta, "split_protocol", "stratified")),
+            "sbert_text": str(
+                embeddings.get("sbert_text")
+                or _identity_field_from_meta(meta, "sbert_text", "embedding_text")
+            ),
         }
     )
 
@@ -173,6 +201,7 @@ def _complete_graph_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
     identity["unique_sequences"] = bool(raw.get("unique_sequences", False))
     identity["fit_on"] = str(raw.get("fit_on") or "all")
     identity["split_protocol"] = str(raw.get("split_protocol") or "stratified")
+    identity["sbert_text"] = str(raw.get("sbert_text") or "embedding_text")
     return identity
 
 

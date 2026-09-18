@@ -14,6 +14,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Bumped when the enricher system prompt changes. Stage-2 cache keys omit git SHA,
+# so this constant is what forces a re-enrich instead of reusing bland templates.
+ENRICHMENT_PROMPT_VERSION = "distinctive_v3"
+
 
 def enrich_templates(
     templates_data: list[dict],
@@ -87,6 +91,18 @@ def enrich_templates(
             logger.warning(
                 "Failed to enrich template %d (%r): %s", i + 1, template[:60], exc
             )
+
+    missing = [
+        int(entry.get("cluster_id", i))
+        for i, entry in enumerate(templates_data)
+        if int(entry.get("cluster_id", 0)) >= 0 and field not in entry
+    ]
+    if missing:
+        logger.warning(
+            "Enrichment missing for %d template(s): cluster_ids=%s",
+            len(missing),
+            missing[:20],
+        )
 
     return templates_data
 

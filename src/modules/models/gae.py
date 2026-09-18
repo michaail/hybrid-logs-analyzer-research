@@ -12,7 +12,9 @@ Decoder (multi-task)
     1. Structure — directed concat-MLP (default) or inner product. Trained
        with BCE on observed edges and *in-graph* non-edges (never cross-graph
        pairs from a PyG mini-batch).
-    2. Node feature reconstruction — 2-layer MLP from latent Z to input dim.
+    2. Node feature reconstruction — 2-layer MLP from latent Z onto the
+       reconstruction columns (full ``x`` or TF-IDF+extras when
+       ``node_reconstruct=without_sbert``).
     3. Edge attribute reconstruction — 2-layer MLP from ⟨Z_i ∥ Z_j⟩.
 
 ``raw_edge_norm`` is intentionally absent: BGL's ``log1p(td_std)`` is ~0 for
@@ -29,6 +31,28 @@ from torch_geometric.nn import GINEConv
 from torch_geometric.utils import negative_sampling, scatter
 
 FULL_STRUCTURE_MAX_NODES = 256
+NODE_EXTRA_DIM = 9
+
+
+def node_recon_index_tensor(
+    node_dim: int,
+    *,
+    sbert_dim: int,
+    extra_dim: int = NODE_EXTRA_DIM,
+) -> torch.Tensor:
+    """Column indices for the node decoder when skipping the SBERT block."""
+    if sbert_dim <= 0:
+        return torch.arange(node_dim, dtype=torch.long)
+    embed_dim = node_dim - extra_dim
+    if embed_dim < sbert_dim:
+        raise ValueError(
+            f"sbert_dim={sbert_dim} exceeds embedding width {embed_dim} "
+            f"(node_dim={node_dim}, extra_dim={extra_dim})."
+        )
+    tfidf_dim = embed_dim - sbert_dim
+    lexical = torch.arange(tfidf_dim, dtype=torch.long)
+    extras = torch.arange(embed_dim, node_dim, dtype=torch.long)
+    return torch.cat([lexical, extras])
 
 
 class AttributeAwareGAE(nn.Module):
@@ -50,6 +74,7 @@ class AttributeAwareGAE(nn.Module):
         gine_aggregation: str = "sum",
         node_transformation: str = "mlp",
         structure_decoder: str = "mlp",
+        node_recon_index: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if structure_decoder not in {"mlp", "inner_product"}:
@@ -58,6 +83,17 @@ class AttributeAwareGAE(nn.Module):
             )
         self.structure_decoder_kind = structure_decoder
         self.latent_dim = latent_dim
+        self.node_dim = int(node_dim)
+        if node_recon_index is None:
+            recon_index = torch.arange(node_dim, dtype=torch.long)
+        else:
+            recon_index = torch.as_tensor(node_recon_index, dtype=torch.long).reshape(-1)
+        if recon_index.numel() == 0:
+            raise ValueError("node_recon_index must contain at least one column.")
+        # Not a state-dict buffer: old packages must keep the historical key set
+        # when recon_dim == node_dim. The index is saved on the training checkpoint.
+        self.node_recon_index = recon_index
+        recon_dim = int(recon_index.numel())
 
         self.raw_node_norm = nn.BatchNorm1d(node_dim, affine=False)
 
@@ -87,13 +123,21 @@ class AttributeAwareGAE(nn.Module):
         self.node_decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, node_dim),
+            nn.Linear(hidden_dim, recon_dim),
         )
         self.edge_decoder = nn.Sequential(
             nn.Linear(latent_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, edge_dim),
         )
+
+    def node_reconstruction_target(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Select the decoder target columns from BatchNorm-scaled node features."""
+        index = self.node_recon_index
+        if index.device != x_norm.device:
+            index = index.to(device=x_norm.device)
+            self.node_recon_index = index
+        return x_norm.index_select(1, index)
 
     def standardize_inputs(
         self,
@@ -314,7 +358,7 @@ def train_epoch(
             loss_str = pos_loss + neg_loss
 
         x_rec = model.decode_node_features(z)
-        loss_node = F.mse_loss(x_rec, x_norm)
+        loss_node = F.mse_loss(x_rec, model.node_reconstruction_target(x_norm))
 
         loss_edge = torch.tensor(0.0, device=device)
         if edge_attr_norm is not None and edge_attr_norm.size(0) > 0:
@@ -376,7 +420,9 @@ def compute_anomaly_scores(
         )
 
         x_rec = model.decode_node_features(z)
-        node_errors = F.mse_loss(x_rec, x_norm, reduction="none").mean(dim=1)
+        node_errors = F.mse_loss(
+            x_rec, model.node_reconstruction_target(x_norm), reduction="none"
+        ).mean(dim=1)
         g_node = scatter(
             node_errors, batch.batch, dim=0, reduce="mean", dim_size=num_graphs
         )

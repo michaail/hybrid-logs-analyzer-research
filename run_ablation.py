@@ -47,7 +47,9 @@ from src.modules.ablation import (
     load_bundle_meta,
     load_matrix,
     load_split_lock,
+    node_reconstruct_from_config,
     save_split_lock,
+    sbert_text_from_config,
     sequence_ids_from_graphs,
     split_protocol_from_config,
     structure_decoder_from_config,
@@ -62,15 +64,21 @@ from src.modules.dataset import (
     attach_cluster_embeddings,
     build_graph_structures,
     compute_embeddings,
+    embedding_block_dims,
     graph_split_dir,
     load_graph_splits,
     load_graph_structures,
     save_graph_dataset,
     save_graph_structures,
+    sbert_dim_from_meta,
     split_dataset,
     split_label_indices,
 )
-from src.modules.enrichment import enrich_templates, load_enriched_templates
+from src.modules.enrichment import (
+    ENRICHMENT_PROMPT_VERSION,
+    enrich_templates,
+    load_enriched_templates,
+)
 from src.modules.graph_builder import select_unique_sequences
 from src.modules.inference_release import (
     HdfsReleaseIdentity,
@@ -177,6 +185,7 @@ def stage2_enrich(
         "llm_enrichment_enabled": bool(ablation["llm_enrichment_enabled"]),
         "enrichment_model_size": "large" if ablation["llm_enrichment_enabled"] else ablation["enrichment_model_size"],
         "enrichment_backend": "deepseek-v4-pro" if ablation["llm_enrichment_enabled"] else None,
+        "enrichment_prompt_version": ENRICHMENT_PROMPT_VERSION,
     }
 
     def build(temp_dir: Path) -> dict[str, Path]:
@@ -352,6 +361,7 @@ def stage45_build_dataset(
             tfidf_enabled=bool(ablation["embeddings"]["tfidf_enabled"]),
             sbert_enabled=bool(ablation["embeddings"]["sbert_enabled"]),
             tfidf_fit_texts=tfidf_fit_texts,
+            sbert_text=sbert_text_from_config(config),
         )
         cluster_embeddings = {
             cluster_id: embedding
@@ -371,6 +381,13 @@ def stage45_build_dataset(
             raise ValueError("Graph builder produced no examples.")
         print(f"[GRAPH] built {len(data_list)} graphs; saving", flush=True)
         sequence_ids = sequence_ids_from_graphs(data_list)
+        tfidf_on = bool(ablation["embeddings"]["tfidf_enabled"])
+        sbert_on = bool(ablation["embeddings"]["sbert_enabled"])
+        tfidf_dim, sbert_dim = embedding_block_dims(
+            int(embeddings.shape[1]),
+            tfidf_enabled=tfidf_on,
+            sbert_enabled=sbert_on,
+        )
         node_dim = int(data_list[0].x.shape[1])
         edge_dim = int(data_list[0].edge_attr.shape[1])
         meta = {
@@ -383,6 +400,8 @@ def stage45_build_dataset(
             "node_dim": node_dim,
             "edge_dim": edge_dim,
             "embed_dim": int(embeddings.shape[1]),
+            "tfidf_dim": tfidf_dim,
+            "sbert_dim": sbert_dim,
             "embedding_flags": ablation["embeddings"],
             "use_edge_features": bool(ablation["graph"]["use_edge_features"]),
             "llm_enrichment_enabled": identity["llm_enrichment_enabled"],
@@ -460,6 +479,8 @@ def stage6_train(
             gine_aggregation=str(ablation_graph["gine_aggregation"]),
             node_transformation=str(ablation_graph["node_transformation"]),
             structure_decoder=structure_decoder_from_config(config),
+            node_reconstruct=node_reconstruct_from_config(config),
+            bundle_meta=bundle_meta,
         )
         metrics_path = temp_dir / "metrics.json"
         metrics_path.write_text(json.dumps({k: v for k, v in metrics.items() if k != "history_epochs"}, indent=2))
@@ -644,6 +665,7 @@ def resolve_hdfs_release_source(
             "dataset": dataset,
             "llm_enrichment_enabled": bool(ablation["llm_enrichment_enabled"]),
             "enrichment_model_size": ablation["enrichment_model_size"],
+            "enrichment_prompt_version": ENRICHMENT_PROMPT_VERSION,
         },
         inputs=[stage1["templates"]],
     )
@@ -876,6 +898,8 @@ def _train_graph_bundle(
     gine_aggregation: str,
     node_transformation: str,
     structure_decoder: str,
+    node_reconstruct: str = "all",
+    bundle_meta: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     import torch
     from sklearn.metrics import (
@@ -934,6 +958,12 @@ def _train_graph_bundle(
         gine_aggregation=gine_aggregation,
         node_transformation=node_transformation,
         structure_decoder=structure_decoder,
+        node_recon_index=_node_recon_index_for_bundle(
+            node_dim=int(node_dim),
+            node_reconstruct=node_reconstruct,
+            split_meta=split_meta,
+            bundle_meta=bundle_meta,
+        ),
     ).to(device)
     optimizer = Adam(model.parameters(), lr=float(training["learning_rate"]))
     loss_args = {
@@ -1019,6 +1049,9 @@ def _train_graph_bundle(
         "gine_aggregation": gine_aggregation,
         "node_transformation": node_transformation,
         "structure_decoder": structure_decoder,
+        "node_reconstruct": node_reconstruct,
+        "node_recon_dim": int(model.node_recon_index.numel()),
+        "node_recon_index": model.node_recon_index.detach().cpu().tolist(),
     }
     metrics["history"] = _loss_history(history)
     eval_payload = {
@@ -1030,6 +1063,31 @@ def _train_graph_bundle(
         "graph_ids": test_ids,
     }
     return metrics, checkpoint, eval_payload
+
+
+def _node_recon_index_for_bundle(
+    *,
+    node_dim: int,
+    node_reconstruct: str,
+    split_meta: dict[str, Any],
+    bundle_meta: dict[str, Any] | None,
+) -> Any:
+    """Full-vector decoder unless fusion asks to skip the SBERT block."""
+    import torch
+
+    from src.modules.models.gae import node_recon_index_tensor
+
+    if node_reconstruct != "without_sbert":
+        return torch.arange(node_dim, dtype=torch.long)
+    meta = dict(bundle_meta or {})
+    nested = split_meta.get("dataset_meta")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            meta.setdefault(key, value)
+    for key, value in split_meta.items():
+        meta.setdefault(key, value)
+    sbert_dim = sbert_dim_from_meta(meta, node_dim=node_dim)
+    return node_recon_index_tensor(node_dim, sbert_dim=sbert_dim)
 
 
 def _normalise_edge_attributes(
@@ -1364,6 +1422,7 @@ def _stage6_config(config: dict[str, Any]) -> dict[str, Any]:
         "gine_aggregation": ablation_graph["gine_aggregation"],
         "node_transformation": ablation_graph["node_transformation"],
         "structure_decoder": structure_decoder_from_config(config),
+        "node_reconstruct": node_reconstruct_from_config(config),
     }
 
 
@@ -1553,6 +1612,7 @@ def prepare_representation_campaign(
     campaign_dir: str | Path | None = None,
     matrix_path: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
+    arms: list[str] | None = None,
 ) -> dict[str, Any]:
     """Parse/enrich/sequence once, then build gzipped Family A graph bundles."""
     workspace, code = _roots(config, workspace_root, code_root)
@@ -1570,6 +1630,18 @@ def prepare_representation_campaign(
         matrix_file = code / "configs" / "ablation_representation.yaml"
     matrix = load_matrix(matrix_file)
     experiments = enabled_experiments(matrix)
+    if arms:
+        requested = {_safe_name(name) for name in arms}
+        available = {_safe_name(str(item["name"])) for item in experiments}
+        unknown = requested - available
+        if unknown:
+            raise ValueError(
+                f"Unknown Family A arm(s): {', '.join(sorted(unknown))}. "
+                f"Available: {', '.join(sorted(available))}."
+            )
+        experiments = [
+            item for item in experiments if _safe_name(str(item["name"])) in requested
+        ]
     _require_torch_geometric()
     print("[CAMPAIGN] enrichment backend: deepseek-v4-pro")
 
@@ -1626,6 +1698,7 @@ def prepare_representation_campaign(
                     "graph_dataset": str(existing.relative_to(destination)),
                     "dataset_meta": "graphs/" + name + "/dataset_meta.json",
                     "identity": graph_identity_from_config(arm_config),
+                    "node_reconstruct": node_reconstruct_from_config(arm_config),
                     "digest": file_digest(existing),
                     "node_dim": json.loads(existing_meta.read_text()).get("node_dim"),
                     "reused": True,
@@ -1665,6 +1738,7 @@ def prepare_representation_campaign(
                 "graph_dataset": str(compressed.relative_to(destination)),
                 "dataset_meta": "graphs/" + name + "/dataset_meta.json",
                 "identity": graph_identity_from_config(arm_config),
+                "node_reconstruct": node_reconstruct_from_config(arm_config),
                 "digest": file_digest(compressed),
                 "node_dim": json.loads((bundle_dir / "dataset_meta.json").read_text()).get("node_dim")
                 if (bundle_dir / "dataset_meta.json").exists()
@@ -1857,6 +1931,14 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
             if "unique_sequences" in identity:
                 overrides.append(
                     f"ablation.graph.unique_sequences={json.dumps(identity['unique_sequences'])}"
+                )
+            if identity.get("sbert_text"):
+                overrides.append(
+                    f"ablation.embeddings.sbert_text={json.dumps(identity['sbert_text'])}"
+                )
+            if graph_entry.get("node_reconstruct"):
+                overrides.append(
+                    f"ablation.fusion.node_reconstruct={json.dumps(graph_entry['node_reconstruct'])}"
                 )
             if identity.get("feature_contract"):
                 overrides.append(

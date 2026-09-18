@@ -93,3 +93,10 @@ experiments:
     overrides:
       experiment.name: gamma_0
       training.gamma: 0.0
+
+  - name: lexical_node_recon
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: lexical_node_recon
+      ablation.fusion.node_reconstruct: without_sbert

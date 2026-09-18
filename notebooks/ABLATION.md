@@ -10,11 +10,12 @@ This file is the operational contract. Implementation lives in this repository (
 |---|---|---|---|
 | **A — representation (HDFS)** | `configs/ablation_representation.yaml` | Yes | `--mode train-only --family A --campaign-dir …` |
 | **A — representation (BGL)** | `configs/ablation_representation_bgl.yaml` | Yes | same, BGL campaign dir |
+| **A — fusion / grounded text (BGL)** | `configs/ablation_fusion_bgl.yaml` | Yes | same, new campaign id, reuse the inductive `split_lock.npz` |
 | **B — train / architecture** | `configs/ablation_train.yaml` | No | `--mode train-only --family B` on `baseline_full` |
 
 `configs/ablation_matrix.yaml` is deprecated. It now re-exports Family B only so an accidental shared-graph `train-only` run cannot fake a TF-IDF vs SBERT ablation.
 
-Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT, edge features, `feature_contract`, `unique_sequences`) disagrees with `dataset_meta.json` on the bundle.
+Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT, edge features, `feature_contract`, `unique_sequences`, `sbert_text`) disagrees with `dataset_meta.json` on the bundle. `ablation.fusion.node_reconstruct` is a train-time decoder mask and does **not** require a new graph.
 
 ## Invariants
 
@@ -22,10 +23,10 @@ Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT,
 - Family A does **not** rebuild collapsed topology seven times. Stage `stage45_graph_structure` caches per-block extras and 10-d edges keyed by dataset + `unique_sequences` + `feature_contract` + `fit_on` + `split_protocol`. Embedding arms (`tfidf_only`, `sbert_only`, `no_llm_enrichment`, …) splice a new node matrix; `no_edge_features` keeps the first edge column. Only `feature_contract_stabilized_v2` needs a second structure pass.
 - HDFS Family A graphs use **one PyG graph per block** (`ablation.graph.unique_sequences: false`): blocks with the same ordered `cluster_id` list can still differ in parameter statistics, edge timing, and labels, so they remain distinct training and evaluation examples. A topology-only representative dataset (`unique_sequences: true`) is an optional efficiency experiment, not the default benchmark; it changes the class distribution and must use its own `split_lock.npz`.
 - Seed 42, clean-train, val-F1 threshold, report test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
-- LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Mistral large/small are not ablation arms.
+- LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Prompt version `distinctive_v3` is part of the stage-2 cache key; changing it re-enriches. MiniLM (`sbert_text: grounded_v1`) encodes enrichment fields only — not Drain templates or raw examples.
 - Default `ablation.feature_contract: notebook_raw_v1` (thesis-comparable). `stabilized_v2` is an explicit Family A arm.
 - Default campaign protocol is **`inductive_v1`**: `ablation.representation.fit_on: train_only`, HDFS per-block graphs, BGL `sequencing.bgl.split: time`, directed `structure_decoder: mlp`, fail-closed HDFS labels, `missing_embedding=fail`. Notebook / `hdfs_baseline.yaml` numbers are **`transductive_v1`** (Drain+TF-IDF fit on the full log, random window split, inner-product structure). Do **not** mix `split_lock.npz` / `graph_dataset.pt.gz` across protocols or compare PR-AUC between them.
-- New campaigns need a new id. Keep `hdfs_ablation_20260916` / notebook ROC-AUC 0.976 as the transductive ceiling. Suggested inductive ids: `hdfs_inductive_v1_20260918`, `bgl_inductive_v1_20260918`.
+- New campaigns need a new id. Keep `hdfs_ablation_20260916` / notebook ROC-AUC 0.976 as the transductive ceiling. Suggested inductive ids: `hdfs_inductive_v1_20260918`, `bgl_inductive_v1_20260918`. Fusion / re-enrich graphs: `bgl_inductive_fusion_v1_20260918` (reuse that campaign's `split_lock.npz`).
 - Structure component AUC in PROCESS.md (~0.52) used batch-level negatives, a symmetric decoder, and positive-only eval scores. After the GAE restore, report structure/node/edge AUCs **before vs after** that change; do not treat a move away from 0.52 as a regression against the notebook.
 - Do not mix sentence-transformers versions inside one dataset campaign. HDFS stays local (ST 2.2.2). A BGL campaign is either fully local (ST 2.2.2) or fully Colab-prepared (ST 5.x via `RUN_PREPARE`). Train-only consumes frozen tensors.
 - Never train from the Drive mount. Stage `.pt.gz` → `/content/workspace`, decompress there.
@@ -140,6 +141,17 @@ Colab prepare needs:
 - Secrets: `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`
 
 Then set `RUN_TRAIN=True` for Family B / A. Rank by PR-AUC under `outputs/bgl/campaigns/<id>/`.
+
+Fusion follow-up (re-enrich + grounded MiniLM text + lexical node reconstruction):
+
+```bash
+python scripts/prepare_bgl_campaign.py \
+  --campaign-id bgl_inductive_fusion_v1_20260918 \
+  --workspace-root /path/to/workspace \
+  --matrix configs/ablation_fusion_bgl.yaml
+```
+
+Copy `campaigns/bgl_inductive_v1_20260918/split_lock.npz` into the new campaign dir first so the time cut stays locked. Family B arm `lexical_node_recon` trains on the **existing** `baseline_full` graph (`ablation.fusion.node_reconstruct: without_sbert`). Spot-check cid 1 / 2 / 3 `embedding_text` after stage 2 before splicing graphs.
 
 Window/step changes would be extra Family A rebuilds, not train-only. Single-graph debug: [`6_GAE_Training_BGL_Colab.ipynb`](./6_GAE_Training_BGL_Colab.ipynb).
 

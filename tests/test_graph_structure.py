@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.modules.dataset import (
     NODE_EXTRA_DIM,
@@ -96,3 +97,45 @@ def test_graph_structure_roundtrip(tmp_path) -> None:
     assert meta["n_unique"] == 1
     np.testing.assert_array_equal(loaded[0]["cluster_ids"], structures[0]["cluster_ids"])
     np.testing.assert_array_equal(loaded[0]["node_extra"], structures[0]["node_extra"])
+
+
+def test_save_graph_dataset_with_zero_edge_graphs(tmp_path) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    from src.modules.dataset import attach_cluster_embeddings, save_graph_dataset
+
+    with_edge = _seq_to_structure(
+        _hdfs_frame("blk_a", [1, 2]),
+        0,
+        dataset="hdfs",
+        hdfs_feature_contract="notebook_raw_v1",
+    )
+    isolated = _seq_to_structure(
+        _hdfs_frame("blk_b", [3]),
+        1,
+        dataset="hdfs",
+        hdfs_feature_contract="notebook_raw_v1",
+    )
+    assert isolated["edge_index"].shape[1] == 0
+    embeddings = {
+        1: np.ones(4, dtype=np.float32),
+        2: np.full(4, 2.0, dtype=np.float32),
+        3: np.full(4, 3.0, dtype=np.float32),
+    }
+    graphs = attach_cluster_embeddings(
+        [with_edge, isolated],
+        embeddings,
+        missing_embedding="fail",
+    )
+    path = tmp_path / "graph_dataset.pt"
+    save_graph_dataset(
+        graphs,
+        np.array([0], dtype=np.int64),
+        np.array([1], dtype=np.int64),
+        np.array([], dtype=np.int64),
+        path,
+        node_dim=int(graphs[0].x.shape[1]),
+        edge_dim=int(graphs[0].edge_attr.shape[1]),
+        embed_dim=4,
+    )
+    assert path.exists()

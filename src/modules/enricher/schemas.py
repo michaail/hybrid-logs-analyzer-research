@@ -73,6 +73,14 @@ class TemplateField(BaseModel):
     source: MetadataSource = "unknown"
     confidence: MetadataConfidence = "unknown"
 
+    @field_validator("placeholder", "semantic_role", mode="before")
+    @classmethod
+    def _coerce_required_str(cls, value: Any) -> str:
+        if value is None:
+            return "unknown"
+        text = str(value).strip()
+        return text or "unknown"
+
 
 class TemplateRelation(BaseModel):
     template_id: str
@@ -93,6 +101,26 @@ class FailureSignal(BaseModel):
     confidence: MetadataConfidence = "unknown"
 
 
+def coerce_string_list(value: Any) -> list[str]:
+    """Accept a JSON array or a single string the model dumped instead of a list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                items.append(text)
+        return items
+    text = str(value).strip()
+    return [text] if text else []
+
+
 class EnrichedTemplate(BaseModel):
     """Observed template metadata and semantic enrichment from one LLM response."""
 
@@ -110,3 +138,8 @@ class EnrichedTemplate(BaseModel):
     dataset_label_caveat: str
     embedding_text: str
     unsupported_inferences: list[str] = Field(default_factory=list)
+
+    @field_validator("explicit_conditions", "unsupported_inferences", mode="before")
+    @classmethod
+    def _coerce_string_lists(cls, value: Any) -> list[str]:
+        return coerce_string_list(value)

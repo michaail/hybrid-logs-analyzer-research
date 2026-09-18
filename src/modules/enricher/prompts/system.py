@@ -32,7 +32,24 @@ RELATION RULES
 - Only return a sequence_context item for a candidate relation supplied in the input.
 - Copy its template_id and relation exactly. Never invent transition or lifecycle edges.
 - Add a failure signal only when the template, examples, documentation, or supplied
-  corpus relation directly supports it.
+  corpus relation directly supports it. Emit one when FATAL, panic, fail, ERROR, or
+  uncorrectable appears in the template or examples. Do not invent follow-on templates
+  (for example uncorrectable variants, heartbeats, or reboot events) that are not in
+  the evidence.
+
+PLACEHOLDER-HEAVY TEMPLATES
+If the template contains two or more <*> tokens, treat it as generic. When the examples
+agree on a payload, describe that payload (for example "generating core.<id>"). Put the
+generic-template note in event_semantics and embedding_text, not in explicit_conditions.
+Do not enumerate other event types that the placeholders could match.
+
+DIAGNOSTIC ROLE
+warning_or_error only when the template or examples contain an explicit fault token
+such as FATAL, ERROR, fail, panic, uncorrectable, or terminated. INFO plus a recovered
+or maintenance action (corrected, bit sparing, detected and corrected) is informational.
+lifecycle_transition is for start/stop/mount/init without a fault token.
+context_dependent when examples disagree or the template is too generic to choose.
+unknown when evidence is insufficient.
 
 OUTPUT
 Return only one JSON object, without Markdown fences or a wrapper key. Its top-level keys
@@ -45,6 +62,9 @@ Each failure_signals item has: name, manifestation, trigger_scope, source, confi
 Each sequence_context item has: template_id, relation, support, source.
 
 ENUMERATION RULES
+- explicit_conditions is a JSON array of short strings copied from the template or
+  examples (for example ["ddr errors detected and corrected"]). Use [] when none are
+  explicit. Never return a paragraph or a bare string.
 - metadata_confidence is exactly one string: "high", "medium", "low", or "unknown".
   Never return a per-field object there; describe per-field confidence only in fields items.
 - diagnostic_role is exactly one string: "informational", "lifecycle_transition",
@@ -59,7 +79,13 @@ ENUMERATION RULES
 - source is exactly one of: "template", "examples", "corpus_relation",
   "documentation", or "unknown".
 
-embedding_text must be one to three compact factual sentences. Exclude template IDs,
-source IDs, dataset-label boilerplate, and unsupported causal explanations.
+embedding_text must be two to four short factual sentences.
+- Reuse distinctive tokens from the template: severity, component, and the specific
+  fault or action (for example "instruction cache parity error corrected").
+- Do not paraphrase those tokens into generic reliability-subsystem boilerplate.
+- Forbidden phrases: "informational message from the reliability subsystem", invented
+  product taxonomy, dataset-label language, and sibling templates that are not in
+  the evidence.
+- Exclude template IDs, source IDs, and unsupported causal explanations.
 """
     )

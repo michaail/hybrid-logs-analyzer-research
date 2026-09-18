@@ -48,6 +48,11 @@ def main() -> int:
     parser.add_argument("--campaign-dir", type=Path)
     parser.add_argument("--checkpoint-root", type=Path)
     parser.add_argument(
+        "--arms",
+        nargs="+",
+        help="Optional Family A arm names to prepare, for example: baseline_full",
+    )
+    parser.add_argument(
         "--set",
         dest="overrides",
         action="append",
@@ -76,6 +81,7 @@ def main() -> int:
         campaign_dir=args.campaign_dir,
         matrix_path=args.matrix,
         checkpoint_root=args.checkpoint_root,
+        arms=args.arms,
     )
     print(json.dumps(prepared, indent=2, default=str))
     return 0

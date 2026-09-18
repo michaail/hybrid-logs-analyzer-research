@@ -1,0 +1,40 @@
+# Family A — BGL fusion / grounded-enrichment graphs.
+# Rebuilds graph_dataset.pt. Reuse the inductive split lock from
+# campaigns/bgl_inductive_v1_20260918 (do not mix with a new Drain parse).
+#
+# Launch:
+#   python scripts/prepare_bgl_campaign.py \
+#     --campaign-id bgl_inductive_fusion_v1_20260918 \
+#     --matrix configs/ablation_fusion_bgl.yaml \
+#     --workspace-root /path/to/workspace
+#   python run_ablation.py --mode train-only --family A --campaign-dir <campaign>
+family: representation
+requires_graph_rebuild: true
+experiments:
+  - name: hybrid_grounded
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: hybrid_grounded
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: grounded_v1
+      ablation.fusion.node_reconstruct: without_sbert
+      ablation.graph.use_edge_features: true
+      ablation.feature_contract: notebook_raw_v1
+
+  - name: sbert_grounded
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_grounded
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: grounded_v1
+      ablation.fusion.node_reconstruct: all
+      ablation.graph.use_edge_features: true
+      ablation.feature_contract: notebook_raw_v1

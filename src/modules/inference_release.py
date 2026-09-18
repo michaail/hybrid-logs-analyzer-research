@@ -463,6 +463,7 @@ def _architecture_from_checkpoint(
                 "edge_mean": _as_float_list(checkpoint.get("edge_mean")),
                 "edge_std": _as_float_list(checkpoint.get("edge_std")),
                 "feature_contract": feature_contract,
+                "node_recon_dim": checkpoint.get("node_recon_dim"),
             }
         )
     except Exception as error:

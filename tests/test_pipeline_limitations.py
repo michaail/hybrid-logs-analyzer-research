@@ -293,6 +293,51 @@ def test_one_epoch_smoke_on_tiny_batch() -> None:
 
 
 @pytest.mark.ml
+def test_without_sbert_decoder_skips_sbert_columns() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    import torch
+    from torch.optim import Adam
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    from src.modules.models.gae import (
+        AttributeAwareGAE,
+        compute_anomaly_scores,
+        node_recon_index_tensor,
+        train_epoch,
+    )
+
+    node_dim = 16
+    sbert_dim = 4
+    index = node_recon_index_tensor(node_dim, sbert_dim=sbert_dim)
+    assert index.numel() == node_dim - sbert_dim
+    graphs = [
+        Data(
+            x=torch.randn(4, node_dim),
+            edge_index=torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long),
+            edge_attr=torch.randn(3, 3),
+            y=torch.tensor([0]),
+            num_nodes=4,
+        )
+    ]
+    loader = DataLoader(graphs, batch_size=1)
+    model = AttributeAwareGAE(
+        node_dim=node_dim,
+        edge_dim=3,
+        hidden_dim=8,
+        latent_dim=4,
+        node_recon_index=index,
+    )
+    assert model.node_decoder[2].out_features == node_dim - sbert_dim
+    opt = Adam(model.parameters(), lr=0.01)
+    total, structure, node, edge = train_epoch(model, loader, opt, torch.device("cpu"))
+    assert np.isfinite(total) and np.isfinite(node)
+    scores, labels = compute_anomaly_scores(model, loader, torch.device("cpu"))
+    assert scores.shape == labels.shape == (1,)
+
+
+@pytest.mark.ml
 def test_graph_directory_dataset_roundtrip(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     import torch

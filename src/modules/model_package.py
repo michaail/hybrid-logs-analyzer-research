@@ -85,6 +85,7 @@ class PackageArchitecture(PackageModel):
     gine_aggregation: Literal["sum", "mean", "max"]
     node_transformation: Literal["mlp", "linear"]
     structure_decoder: Literal["mlp", "inner_product"] = "inner_product"
+    node_recon_dim: int | None = None
     edge_mean: list[float] | None = None
     edge_std: list[float] | None = None
     feature_contract: Literal["notebook_raw_v1", "stabilized_v2"] = "stabilized_v2"
@@ -196,6 +197,7 @@ def expected_state_dict_spec(architecture: PackageArchitecture) -> dict[str, Ten
     """Return the AttributeAwareGAE tensor key set for an architecture."""
 
     node_dim = architecture.node_dim
+    recon_dim = int(architecture.node_recon_dim or node_dim)
     edge_dim = architecture.edge_dim
     hidden_dim = architecture.hidden_dim
     latent_dim = architecture.latent_dim
@@ -214,8 +216,8 @@ def expected_state_dict_spec(architecture: PackageArchitecture) -> dict[str, Ten
         "encoder_conv.lin.bias": TensorSpec((hidden_dim,), float_spec),
         "node_decoder.0.weight": TensorSpec((hidden_dim, latent_dim), float_spec),
         "node_decoder.0.bias": TensorSpec((hidden_dim,), float_spec),
-        "node_decoder.2.weight": TensorSpec((node_dim, hidden_dim), float_spec),
-        "node_decoder.2.bias": TensorSpec((node_dim,), float_spec),
+        "node_decoder.2.weight": TensorSpec((recon_dim, hidden_dim), float_spec),
+        "node_decoder.2.bias": TensorSpec((recon_dim,), float_spec),
         "edge_decoder.0.weight": TensorSpec((hidden_dim, latent_dim * 2), float_spec),
         "edge_decoder.0.bias": TensorSpec((hidden_dim,), float_spec),
         "edge_decoder.2.weight": TensorSpec((edge_dim, hidden_dim), float_spec),

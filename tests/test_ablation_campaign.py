@@ -95,6 +95,10 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     run_ablation_src = (REPOSITORY_ROOT / "run_ablation.py").read_text()
     assert 'else "both"' not in run_ablation_src
     assert "deepseek-v4-pro" in run_ablation_src
+    assert "enrichment_prompt_version" in run_ablation_src
+    from src.modules.enrichment import ENRICHMENT_PROMPT_VERSION
+
+    assert ENRICHMENT_PROMPT_VERSION == "distinctive_v3"
     enrichment_src = (REPOSITORY_ROOT / "src" / "modules" / "enrichment.py").read_text()
     assert "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO" in enrichment_src
     assert "AZURE_OPENAI_DEPLOYMENT_MISTRAL_LARGE" not in enrichment_src
@@ -142,6 +146,7 @@ def test_feature_contract_defaults_to_notebook_raw() -> None:
             "split_protocol": "stratified",
         },
     )
+    assert identity["sbert_text"] == "embedding_text"
 
 
 def test_train_only_guard_allows_legacy_baseline_without_meta() -> None:
@@ -372,3 +377,55 @@ def test_stage45_structure_config_ignores_embeddings_and_edge_flag() -> None:
     stabilized = _baseline_config()
     stabilized["ablation"]["feature_contract"] = "stabilized_v2"
     assert run_ablation._stage45_structure_config(stabilized) != hybrid
+
+
+def test_missing_sbert_text_meta_matches_embedding_text() -> None:
+    config = _baseline_config()
+    meta = {
+        "llm_enrichment_enabled": True,
+        "enrichment_model_size": "large",
+        "tfidf_enabled": True,
+        "sbert_enabled": True,
+        "use_edge_features": True,
+        "feature_contract": "notebook_raw_v1",
+        "unique_sequences": False,
+        "fit_on": "train_only",
+        "split_protocol": "stratified",
+    }
+    actual = graph_identity_from_meta(meta)
+    assert actual is not None
+    assert actual["sbert_text"] == "embedding_text"
+    assert_train_only_compatible(config, bundle_meta=meta)
+    grounded = dict(meta)
+    grounded["sbert_text"] = "grounded_v1"
+    with pytest.raises(GraphIdentityError, match="mismatch"):
+        assert_train_only_compatible(config, bundle_meta=grounded)
+
+
+def test_fusion_yaml_rebuilds_and_train_arm_does_not() -> None:
+    fusion = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_fusion_bgl.yaml")
+    train = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_train.yaml")
+    assert fusion["family"] == "representation"
+    assert fusion["requires_graph_rebuild"] is True
+    names = {item["name"] for item in enabled_experiments(fusion)}
+    assert names == {"hybrid_grounded", "sbert_grounded"}
+    assert all(experiment_requires_graph_rebuild(item, fusion) for item in enabled_experiments(fusion))
+    hybrid = next(item for item in enabled_experiments(fusion) if item["name"] == "hybrid_grounded")
+    sbert = next(item for item in enabled_experiments(fusion) if item["name"] == "sbert_grounded")
+    assert hybrid["overrides"]["ablation.embeddings.sbert_text"] == "grounded_v1"
+    assert sbert["overrides"]["ablation.embeddings.sbert_text"] == "grounded_v1"
+    assert hybrid["overrides"]["ablation.fusion.node_reconstruct"] == "without_sbert"
+    assert sbert["overrides"]["ablation.fusion.node_reconstruct"] == "all"
+    train_names = {item["name"] for item in enabled_experiments(train)}
+    assert "lexical_node_recon" in train_names
+    lexical = next(item for item in enabled_experiments(train) if item["name"] == "lexical_node_recon")
+    assert experiment_requires_graph_rebuild(lexical, train) is False
+    assert lexical["overrides"]["ablation.fusion.node_reconstruct"] == "without_sbert"
+
+
+def test_node_reconstruct_is_not_graph_identity() -> None:
+    config = _baseline_config()
+    config["ablation"]["fusion"] = {"node_reconstruct": "without_sbert"}
+    identity = graph_identity_from_config(config)
+    assert "node_reconstruct" not in identity
+    assert identity["sbert_text"] == "embedding_text"

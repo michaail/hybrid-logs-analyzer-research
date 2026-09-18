@@ -147,3 +147,40 @@ def test_enricher_parse_fills_omitted_dataset_label_caveat() -> None:
     parsed = Enricher._parse_response(json.dumps(payload))
     assert parsed.dataset_label_caveat
     assert "omitted by the model" in " ".join(parsed.unsupported_inferences)
+
+
+def test_enricher_parse_drops_null_field_placeholders() -> None:
+    payload = {
+        **VALID_ENRICHMENT,
+        "fields": [
+            {
+                "placeholder": None,
+                "semantic_role": None,
+                "source": "template",
+                "confidence": "low",
+            },
+            {
+                "placeholder": "<*>",
+                "semantic_role": "count",
+                "source": "template",
+                "confidence": "high",
+            },
+        ],
+    }
+    parsed = Enricher._parse_response(json.dumps(payload))
+    assert len(parsed.fields) == 1
+    assert parsed.fields[0].placeholder == "<*>"
+    assert parsed.fields[0].semantic_role == "count"
+
+
+def test_enricher_parse_coerces_string_explicit_conditions() -> None:
+    payload = {
+        **VALID_ENRICHMENT,
+        "explicit_conditions": "The template is generic with no single observed event type.",
+        "unsupported_inferences": "none",
+    }
+    parsed = Enricher._parse_response(json.dumps(payload))
+    assert parsed.explicit_conditions == [
+        "The template is generic with no single observed event type."
+    ]
+    assert "none" in parsed.unsupported_inferences

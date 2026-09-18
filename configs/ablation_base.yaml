@@ -41,6 +41,12 @@ ablation:
   embeddings:
     tfidf_enabled: true
     sbert_enabled: true
+    # embedding_text = LLM paragraph only (template fallback if enrichment is off).
+    # grounded_v1 = enrichment fields only; MiniLM never sees Drain templates.
+    sbert_text: embedding_text
+  fusion:
+    # all = reconstruct every node column. without_sbert = TF-IDF + extras only.
+    node_reconstruct: all
   graph:
     use_edge_features: true
     # HDFS blocks with identical template order may differ in parameters and timing.

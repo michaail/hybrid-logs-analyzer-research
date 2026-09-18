@@ -4,7 +4,7 @@ from typing import Any
 
 from .llm import LLM
 from .prompts import BGL_DATASET_CONTEXT, HDFS_DATASET_CONTEXT, TEMPLATE_PROMPT
-from .schemas import EnrichedTemplate, TemplateContext
+from .schemas import EnrichedTemplate, TemplateContext, coerce_string_list
 
 
 class Enricher:
@@ -111,12 +111,14 @@ class Enricher:
         payload["sequence_context"] = Enricher._normalise_relations(
             payload.get("sequence_context", [])
         )
-        payload.setdefault("explicit_conditions", [])
-        unsupported = payload.setdefault("unsupported_inferences", [])
-        if not isinstance(unsupported, list):
-            unsupported = [str(unsupported)]
-            payload["unsupported_inferences"] = unsupported
-        unsupported.extend(failure_signal_notes)
+        payload["explicit_conditions"] = coerce_string_list(
+            payload.get("explicit_conditions")
+        )
+        payload["unsupported_inferences"] = coerce_string_list(
+            payload.get("unsupported_inferences")
+        )
+        payload["unsupported_inferences"].extend(failure_signal_notes)
+        unsupported = payload["unsupported_inferences"]
         payload["metadata_confidence"], confidence_note = (
             Enricher._normalise_confidence(payload.get("metadata_confidence"))
         )
@@ -184,11 +186,18 @@ class Enricher:
             if not isinstance(item, dict):
                 continue
             field = dict(item)
-            field.setdefault("placeholder", field.pop("name", "unknown"))
-            field.setdefault(
-                "semantic_role",
-                field.pop("role", field.pop("description", "unknown")),
-            )
+            placeholder = field.get("placeholder")
+            if placeholder is None:
+                placeholder = field.pop("name", None)
+            semantic_role = field.get("semantic_role")
+            if semantic_role is None:
+                semantic_role = field.pop("role", field.pop("description", None))
+            placeholder = "" if placeholder is None else str(placeholder).strip()
+            semantic_role = "" if semantic_role is None else str(semantic_role).strip()
+            if not placeholder and not semantic_role:
+                continue
+            field["placeholder"] = placeholder or "unknown"
+            field["semantic_role"] = semantic_role or "unknown"
             field.setdefault("source", field.pop("evidence", "unknown"))
             if field["source"] not in {
                 "template",

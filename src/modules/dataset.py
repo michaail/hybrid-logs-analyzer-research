@@ -31,7 +31,7 @@ import pickle
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, Mapping, cast
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,9 @@ HdfsFeatureContract = Literal["notebook_raw_v1", "stabilized_v2"]
 NODE_EXTRA_DIM = 9
 STRUCTURE_EDGE_DIM = 10
 STRUCTURE_CACHE_VERSION = 1
+SBERT_EMBED_DIM = 384
+SBERT_TEXT_EMBEDDING = "embedding_text"
+SBERT_TEXT_GROUNDED = "grounded_v1"
 
 
 class MissingClusterEmbedding(ValueError):
@@ -65,6 +68,125 @@ class MissingSequenceLabel(KeyError):
 TFIDF_DENSE_MAX_FEATURES = 10_000
 
 
+def compose_sbert_text(
+    template: str = "",
+    enriched: Mapping[str, Any] | None = None,
+    *,
+    mode: str = SBERT_TEXT_EMBEDDING,
+) -> str:
+    """Build the MiniLM input from LLM enrichment fields only.
+
+    Drain templates and raw examples are never encoded. Distinctive tokens must
+    come from the enricher. ``embedding_text`` uses the LLM paragraph and falls
+    back to the Drain template only when enrichment is missing (historical
+    llm-off recipe). ``grounded_v1`` concatenates enrichment metadata,
+    ``embedding_text``, ``event_semantics``, and explicit failure signals.
+    """
+    if mode not in {SBERT_TEXT_EMBEDDING, SBERT_TEXT_GROUNDED}:
+        raise ValueError(
+            f"sbert_text must be {SBERT_TEXT_EMBEDDING!r} or {SBERT_TEXT_GROUNDED!r}, got {mode!r}"
+        )
+    if mode == SBERT_TEXT_EMBEDDING:
+        if enriched:
+            text = str(enriched.get("embedding_text") or "").strip()
+            if text:
+                return text
+        return str(template or "").strip() or "unknown log template"
+
+    if not enriched:
+        return "unknown log template"
+    parts: list[str] = []
+    meta_bits = [
+        str(enriched.get(key) or "").strip()
+        for key in ("log_level", "diagnostic_role", "operation")
+    ]
+    meta_line = " ".join(bit for bit in meta_bits if bit)
+    if meta_line:
+        parts.append(meta_line)
+    for key in ("embedding_text", "event_semantics"):
+        value = str(enriched.get(key) or "").strip()
+        if value:
+            parts.append(value)
+    for signal in enriched.get("failure_signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        if signal.get("trigger_scope") != "explicit_in_template":
+            continue
+        chunk = " ".join(
+            str(signal.get(key) or "").strip()
+            for key in ("name", "manifestation")
+        ).strip()
+        if chunk:
+            parts.append(chunk)
+    return " ".join(parts).strip() or "unknown log template"
+
+
+def embedding_block_dims(
+    embed_dim: int,
+    *,
+    tfidf_enabled: bool,
+    sbert_enabled: bool,
+    sbert_width: int = SBERT_EMBED_DIM,
+) -> tuple[int, int]:
+    """Return ``(tfidf_dim, sbert_dim)`` for a concatenated embedding block."""
+    if tfidf_enabled and sbert_enabled:
+        if embed_dim <= sbert_width:
+            raise ValueError(
+                f"Hybrid embed_dim={embed_dim} is too small for MiniLM width {sbert_width}."
+            )
+        return int(embed_dim - sbert_width), int(sbert_width)
+    if sbert_enabled:
+        return 0, int(embed_dim)
+    return int(embed_dim), 0
+
+
+def sbert_dim_from_meta(meta: Mapping[str, Any] | None, node_dim: int | None = None) -> int:
+    """SBERT block width from dataset_meta, or MiniLM convention on old bundles."""
+    if not meta:
+        return 0
+    if meta.get("sbert_dim") is not None:
+        return int(meta["sbert_dim"])
+    flags = meta.get("embedding_flags") or {}
+    identity = meta.get("graph_identity") or {}
+    sbert_enabled = bool(flags.get("sbert_enabled", identity.get("sbert_enabled", False)))
+    tfidf_enabled = bool(flags.get("tfidf_enabled", identity.get("tfidf_enabled", True)))
+    embed_dim = int(meta.get("embed_dim") or 0)
+    if embed_dim <= 0:
+        width = int(node_dim or meta.get("node_dim") or 0)
+        embed_dim = max(width - NODE_EXTRA_DIM, 0)
+    if embed_dim <= 0 or not sbert_enabled:
+        return 0
+    _, sbert_dim = embedding_block_dims(
+        embed_dim, tfidf_enabled=tfidf_enabled, sbert_enabled=True
+    )
+    return sbert_dim
+
+
+def node_recon_indices(
+    node_dim: int,
+    *,
+    sbert_dim: int,
+    extra_dim: int = NODE_EXTRA_DIM,
+) -> np.ndarray:
+    """Column indices to reconstruct when skipping the SBERT block.
+
+    Layout is ``[tfidf | sbert | extras]``. ``sbert_dim=0`` reconstructs every
+    column (identical to the historical full-vector decoder).
+    """
+    if sbert_dim <= 0:
+        return np.arange(node_dim, dtype=np.int64)
+    embed_dim = node_dim - extra_dim
+    if embed_dim < sbert_dim:
+        raise ValueError(
+            f"sbert_dim={sbert_dim} exceeds embedding width {embed_dim} "
+            f"(node_dim={node_dim}, extra_dim={extra_dim})."
+        )
+    tfidf_dim = embed_dim - sbert_dim
+    lexical = np.arange(tfidf_dim, dtype=np.int64)
+    extras = np.arange(embed_dim, node_dim, dtype=np.int64)
+    return np.concatenate([lexical, extras])
+
+
 def _require_torch_geometric() -> None:
     """Fail before the per-sequence loop if PyG is missing from this venv."""
     try:
@@ -87,6 +209,7 @@ def compute_embeddings(
     tfidf_enabled: bool = True,
     sbert_enabled: bool = True,
     tfidf_fit_texts: list[str] | None = None,
+    sbert_text: str = SBERT_TEXT_EMBEDDING,
 ) -> tuple[np.ndarray, list[int], Any]:
     """Compute hybrid (TF-IDF + SBERT) template embedding matrix.
 
@@ -163,16 +286,17 @@ def compute_embeddings(
             ) from exc
 
         sbert_model = SentenceTransformer("all-MiniLM-L6-v2")
+        template_by_cid = {int(item["cluster_id"]): item for item in templates_data}
         enriched_texts: list[str] = []
         for cid in all_cids:
-            info = cluster_to_enriched.get(cid)
-            if info:
-                text = info.get("embedding_text", "").strip()
-            else:
-                text = cluster_to_template.get(cid, "").strip()
-            if not text:
-                text = cluster_to_template.get(cid, "unknown log template")
-            enriched_texts.append(text)
+            record = template_by_cid.get(int(cid), {})
+            enriched_texts.append(
+                compose_sbert_text(
+                    str(record.get("template") or cluster_to_template.get(cid, "")),
+                    cluster_to_enriched.get(cid),
+                    mode=sbert_text,
+                )
+            )
 
         sbert_emb = sbert_model.encode(
             enriched_texts, show_progress_bar=True, normalize_embeddings=True
@@ -262,6 +386,17 @@ def build_graph_structures(
     return structures, stats
 
 
+def _as_owned_tensor(array: np.ndarray, *, dtype: "torch.dtype") -> "torch.Tensor":
+    """Copy *array* into a tensor that does not share storage with NumPy or siblings.
+
+    ``torch.from_numpy`` on empty or sliced buffers can alias the same data_ptr
+    under different dtypes, which ``torch.save`` rejects.
+    """
+    import torch
+
+    return torch.tensor(np.ascontiguousarray(array), dtype=dtype)
+
+
 def attach_cluster_embeddings(
     structures: list[dict[str, Any]],
     cluster_embeddings: dict[int, np.ndarray],
@@ -312,9 +447,12 @@ def attach_cluster_embeddings(
         kwargs = {id_col: structure["seq_id"], "num_nodes": int(structure["num_nodes"])}
         all_data.append(
             Data(
-                x=torch.from_numpy(node_feats),
-                edge_index=torch.from_numpy(np.asarray(structure["edge_index"], dtype=np.int64)),
-                edge_attr=torch.from_numpy(edge_attr_np),
+                x=_as_owned_tensor(node_feats, dtype=torch.float32),
+                edge_index=_as_owned_tensor(
+                    np.asarray(structure["edge_index"], dtype=np.int64),
+                    dtype=torch.long,
+                ),
+                edge_attr=_as_owned_tensor(edge_attr_np, dtype=torch.float32),
                 y=torch.tensor([int(structure["y"])], dtype=torch.long),
                 **kwargs,
             )
@@ -485,6 +623,9 @@ def save_graph_dataset(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    idx_train = np.ascontiguousarray(idx_train, dtype=np.int64).copy()
+    idx_val = np.ascontiguousarray(idx_val, dtype=np.int64).copy()
+    idx_test = np.ascontiguousarray(idx_test, dtype=np.int64).copy()
     payload: dict[str, Any] = {
         "data_list": all_data,
         "idx_train": idx_train,
