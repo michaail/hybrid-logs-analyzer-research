@@ -58,6 +58,9 @@ def enrich_templates(
     field = "enriched_large"
 
     for i, entry in enumerate(templates_data):
+        if int(entry.get("cluster_id", 0)) < 0:
+            logger.info("Skipping OOV template cluster_id=%s", entry.get("cluster_id"))
+            continue
         template = entry["template"]
         try:
             context = TemplateContext.from_template_record(

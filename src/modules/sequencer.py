@@ -6,16 +6,22 @@ Two strategies, toggled via ``dataset``:
   is grouped with all other lines sharing the same ``block_id``, producing
   one sequence per HDFS block (one sequence = one anomaly-labelling unit).
 
-* ``"bgl"`` — Sliding time-window: the log is partitioned into overlapping
-  fixed-length time windows.  Every line falling inside a window appears in
-  that window's sequence.  A window is labelled anomalous if at least one
-  of its lines has ``is_anomaly == True``.
+* ``"bgl"`` — Sliding time-window: the log is partitioned into time windows.
+  A window is labelled anomalous if at least one of its lines has
+  ``is_anomaly == True``.
+
+  ``split="time"`` cuts the event stream into train/val/test **before**
+  window construction so a window cannot straddle the cut and overlap is
+  confined to one split. ``split="stratified"`` windows the full stream
+  (notebook-era behaviour; pair only with a later random graph split).
 
 Public API
 ----------
     build_sequences(df, dataset, **kwargs)  → dict
     save_sequences(df_blocks, output_path)
     load_sequences(path, dataset)           → (df_blocks, sequences)
+    event_count_slices(n, train_ratio, val_ratio)
+    bgl_split_name(window_id)
 """
 
 from __future__ import annotations
@@ -31,13 +37,61 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Namespace window_id by split so train/val/test unix starts cannot collide.
+BGL_SPLIT_STRIDE = 1 << 40
+
 
 def _parquet_engine() -> str:
     """Prefer fastparquet for legacy artifacts, with a PyArrow fallback."""
     return "fastparquet" if find_spec("fastparquet") else "pyarrow"
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def event_count_slices(
+    n: int,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> tuple[int, int, int]:
+    """Return (n_train, n_val, n_test) covering *n* time-ordered events."""
+    if n <= 0:
+        return 0, 0, 0
+    n_train = max(1, int(n * train_ratio))
+    n_val = max(1, int(n * val_ratio))
+    if n_train + n_val >= n:
+        n_test = 1 if n >= 3 else 0
+        leftover = n - n_test
+        n_train = max(1, leftover // 2) if leftover >= 2 else leftover
+        n_val = leftover - n_train
+        return n_train, n_val, n - n_train - n_val
+    n_test = n - n_train - n_val
+    return n_train, n_val, n_test
+
+
+def bgl_split_name(window_id: int) -> str:
+    """Map a namespaced BGL window_id back to train/val/test."""
+    value = int(window_id)
+    if value >= 2 * BGL_SPLIT_STRIDE:
+        return "test"
+    if value >= BGL_SPLIT_STRIDE:
+        return "val"
+    return "train"
+
+
+def split_indices_from_bgl_windows(sequence_ids: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build idx_train/val/test from time-namespaced window ids (stable order)."""
+    train, val, test = [], [], []
+    for index, sequence_id in enumerate(sequence_ids):
+        name = bgl_split_name(int(sequence_id))
+        if name == "train":
+            train.append(index)
+        elif name == "val":
+            val.append(index)
+        else:
+            test.append(index)
+    return (
+        np.asarray(train, dtype=np.int64),
+        np.asarray(val, dtype=np.int64),
+        np.asarray(test, dtype=np.int64),
+    )
 
 
 def build_sequences(
@@ -46,6 +100,9 @@ def build_sequences(
     *,
     window_minutes: int = 20,
     step_minutes: int = 10,
+    split: str = "stratified",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
 ) -> dict:
     """Route to the dataset-appropriate sequencer.
 
@@ -57,21 +114,32 @@ def build_sequences(
         ``"hdfs"`` or ``"bgl"``.
     window_minutes, step_minutes : int
         BGL-only sliding-window parameters (ignored for HDFS).
+    split : str
+        BGL only: ``"time"`` (cut events, then window) or ``"stratified"``
+        (window the full stream).
+    train_ratio, val_ratio : float
+        Event-count fractions used when ``split="time"``.
 
     Returns
     -------
     dict
         ``{sequence_id: group_DataFrame}`` mapping.  For HDFS the keys are
-        ``block_id`` strings; for BGL they are integer UNIX window-start
-        timestamps.
+        ``block_id`` strings; for BGL they are integer window ids.
     """
     dataset = dataset.lower()
     if dataset == "hdfs":
         return _build_hdfs_sequences(df)
-    elif dataset == "bgl":
+    if dataset == "bgl":
+        if str(split).lower() == "time":
+            return _build_bgl_sequences_time_split(
+                df,
+                window_minutes=window_minutes,
+                step_minutes=step_minutes,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+            )
         return _build_bgl_sequences(df, window_minutes=window_minutes, step_minutes=step_minutes)
-    else:
-        raise ValueError(f"Unknown dataset {dataset!r}. Choose 'hdfs' or 'bgl'.")
+    raise ValueError(f"Unknown dataset {dataset!r}. Choose 'hdfs' or 'bgl'.")
 
 
 def save_sequences(df_blocks: pd.DataFrame, output_path: str | Path) -> None:
@@ -108,9 +176,6 @@ def load_sequences(
     return df_blocks, sequences
 
 
-# ── HDFS sequencer ────────────────────────────────────────────────────────────
-
-
 def _build_hdfs_sequences(df: pd.DataFrame) -> dict:
     """Group HDFS log lines by ``block_id`` (one sequence per HDFS block)."""
     t0 = time.time()
@@ -128,7 +193,51 @@ def _build_hdfs_sequences(df: pd.DataFrame) -> dict:
     return sequences
 
 
-# ── BGL sliding-window sequencer ──────────────────────────────────────────────
+def _window_one_span(
+    df: pd.DataFrame,
+    *,
+    window_minutes: int,
+    step_minutes: int,
+    id_offset: int,
+) -> dict:
+    """Sliding windows over one contiguous time span (one split)."""
+    if df.empty:
+        return {}
+    df = df.dropna(subset=["unix_ts"]).sort_values("unix_ts").reset_index(drop=True)
+    df["unix_ts"] = df["unix_ts"].astype(np.int64)
+    window_seconds = window_minutes * 60
+    step_seconds = step_minutes * 60
+    unix_arr = df["unix_ts"].values
+    t_min = int(unix_arr[0])
+    t_max = int(unix_arr[-1])
+    if t_max < t_min + window_seconds:
+        # Span shorter than one window: keep a single window of whatever is there.
+        window_starts = np.array([t_min], dtype=np.int64)
+    else:
+        window_starts = np.arange(
+            t_min, t_max - window_seconds + 1, step_seconds, dtype=np.int64
+        )
+
+    row_indices: list[np.ndarray] = []
+    win_ids: list[np.ndarray] = []
+    for w_start in window_starts:
+        lo = int(np.searchsorted(unix_arr, w_start, side="left"))
+        hi = int(np.searchsorted(unix_arr, w_start + window_seconds, side="left"))
+        n = hi - lo
+        if n == 0:
+            continue
+        wid = int(w_start) + int(id_offset)
+        row_indices.append(np.arange(lo, hi, dtype=np.int64))
+        win_ids.append(np.full(n, wid, dtype=np.int64))
+
+    if not row_indices:
+        return {}
+    all_rows = np.concatenate(row_indices)
+    all_wids = np.concatenate(win_ids)
+    df_windows = df.iloc[all_rows].copy()
+    df_windows["window_id"] = all_wids
+    df_windows = df_windows.sort_values(["window_id", "unix_ts"]).reset_index(drop=True)
+    return {wid: grp for wid, grp in df_windows.groupby("window_id", sort=False)}
 
 
 def _build_bgl_sequences(
@@ -137,69 +246,58 @@ def _build_bgl_sequences(
     window_minutes: int = 20,
     step_minutes: int = 10,
 ) -> dict:
-    """Partition BGL log lines into overlapping sliding time windows.
-
-    Uses ``searchsorted`` for O(W_count × log N) assignment — fast even on
-    millions of log lines.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain a ``unix_ts`` column (integer or float seconds since epoch).
-    window_minutes : int
-        Width of each time window in minutes.
-    step_minutes : int
-        Stride between consecutive window starts.  ``step < window`` gives
-        overlapping windows (recommended for anomaly detection).
-
-    Returns
-    -------
-    dict
-        ``{window_start_unix: group_DataFrame}``
-    """
+    """Partition BGL log lines into sliding time windows on the full stream."""
     t0 = time.time()
-
-    df = df.dropna(subset=["unix_ts"]).sort_values("unix_ts").reset_index(drop=True)
-    df["unix_ts"] = df["unix_ts"].astype(np.int64)
-
-    window_seconds = window_minutes * 60
-    step_seconds = step_minutes * 60
-
-    unix_arr = df["unix_ts"].values
-    t_min = int(unix_arr[0])
-    t_max = int(unix_arr[-1])
-
-    window_starts = np.arange(
-        t_min, t_max - window_seconds + 1, step_seconds, dtype=np.int64
+    sequences = _window_one_span(
+        df, window_minutes=window_minutes, step_minutes=step_minutes, id_offset=0
     )
-
-    row_indices: list[np.ndarray] = []
-    win_ids: list[np.ndarray] = []
-
-    for w_start in window_starts:
-        lo = int(np.searchsorted(unix_arr, w_start, side="left"))
-        hi = int(np.searchsorted(unix_arr, w_start + window_seconds, side="left"))
-        n = hi - lo
-        if n == 0:
-            continue
-        row_indices.append(np.arange(lo, hi, dtype=np.int64))
-        win_ids.append(np.full(n, w_start, dtype=np.int64))
-
-    if not row_indices:
+    if not sequences:
         logger.warning("BGL sequencer produced 0 non-empty windows. Check log timestamps.")
         return {}
-
-    all_rows = np.concatenate(row_indices)
-    all_wids = np.concatenate(win_ids)
-
-    df_windows = df.iloc[all_rows].copy()
-    df_windows["window_id"] = all_wids
-    df_windows = df_windows.sort_values(["window_id", "unix_ts"]).reset_index(drop=True)
-
-    sequences = {wid: grp for wid, grp in df_windows.groupby("window_id", sort=False)}
     logger.info(
         "BGL sequencer: %d non-empty windows (W=%d min, step=%d min) in %.2fs",
         len(sequences),
+        window_minutes,
+        step_minutes,
+        time.time() - t0,
+    )
+    return sequences
+
+
+def _build_bgl_sequences_time_split(
+    df: pd.DataFrame,
+    *,
+    window_minutes: int,
+    step_minutes: int,
+    train_ratio: float,
+    val_ratio: float,
+) -> dict:
+    """Cut the event stream by count, then window inside each split."""
+    t0 = time.time()
+    ordered = df.dropna(subset=["unix_ts"]).sort_values("unix_ts").reset_index(drop=True)
+    n_train, n_val, n_test = event_count_slices(len(ordered), train_ratio, val_ratio)
+    slices = {
+        "train": (ordered.iloc[:n_train], 0),
+        "val": (ordered.iloc[n_train : n_train + n_val], BGL_SPLIT_STRIDE),
+        "test": (ordered.iloc[n_train + n_val :], 2 * BGL_SPLIT_STRIDE),
+    }
+    sequences: dict = {}
+    counts: dict[str, int] = {}
+    for name, (span, offset) in slices.items():
+        part = _window_one_span(
+            span, window_minutes=window_minutes, step_minutes=step_minutes, id_offset=offset
+        )
+        counts[name] = len(part)
+        sequences.update(part)
+    logger.info(
+        "BGL time-split sequencer: train=%d val=%d test=%d windows "
+        "(events %d/%d/%d, W=%d min, step=%d min) in %.2fs",
+        counts.get("train", 0),
+        counts.get("val", 0),
+        counts.get("test", 0),
+        n_train,
+        n_val,
+        n_test,
         window_minutes,
         step_minutes,
         time.time() - t0,

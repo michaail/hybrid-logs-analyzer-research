@@ -11,17 +11,21 @@ At least one must be True.
 Public API
 ----------
     compute_embeddings(templates_data, cluster_to_enriched, *, ...) → (ndarray, cids, vec)
+    densify_tfidf_rows(matrix) → ndarray
     build_graph_structures(sequences, block_labels, *, ...) → (list[dict], stats)
     attach_cluster_embeddings(structures, cluster_embeddings, *, ...) → list[Data]
     build_pyg_dataset(sequences, block_labels, cluster_embeddings, *, ...) → list[Data]
     split_dataset(all_data, seed, *, ...) → (idx_train, idx_val, idx_test)
     save_graph_dataset(all_data, ..., path, *, ...)
+    load_graph_splits(path) → (train, val, test, meta)
+    GraphDirectoryDataset(directory) — lazy per-graph ``*.pt`` shards
     save_graph_structures(path, structures, meta)
     load_graph_structures(path) → (structures, meta)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 import time
@@ -47,6 +51,20 @@ class MissingClusterEmbedding(ValueError):
         super().__init__(f"Cluster {cluster_id} has no frozen embedding.")
 
 
+class MissingSequenceLabel(KeyError):
+    """Raised when a sequence has no ground-truth anomaly label."""
+
+    def __init__(self, sequence_id: Any) -> None:
+        self.sequence_id = sequence_id
+        super().__init__(
+            f"Sequence {sequence_id!r} has no label. "
+            "Refusing to treat unlabeled sequences as normal."
+        )
+
+
+TFIDF_DENSE_MAX_FEATURES = 10_000
+
+
 def _require_torch_geometric() -> None:
     """Fail before the per-sequence loop if PyG is missing from this venv."""
     try:
@@ -68,6 +86,7 @@ def compute_embeddings(
     *,
     tfidf_enabled: bool = True,
     sbert_enabled: bool = True,
+    tfidf_fit_texts: list[str] | None = None,
 ) -> tuple[np.ndarray, list[int], Any]:
     """Compute hybrid (TF-IDF + SBERT) template embedding matrix.
 
@@ -79,6 +98,10 @@ def compute_embeddings(
         Mapping ``cluster_id → enrichment dict``.
     tfidf_enabled, sbert_enabled : bool
         Ablation toggles.  At least one must be True.
+    tfidf_fit_texts : list[str] | None
+        If given, the TF-IDF vocabulary and IDF are fitted on this subset
+        (train templates) and every template is then ``transform``ed.
+        ``None`` fits on all templates (transductive).
 
     Returns
     -------
@@ -102,12 +125,31 @@ def compute_embeddings(
 
     # ── TF-IDF (structural token features) ───────────────────────────────────
     if tfidf_enabled:
+        fit_corpus = list(tfidf_fit_texts) if tfidf_fit_texts is not None else all_templates
+        if not fit_corpus:
+            raise ValueError("TF-IDF requires at least one training template.")
         tfidf_vectorizer = TfidfVectorizer(analyzer="word", token_pattern=r"[^\s]+")
-        tfidf_matrix = tfidf_vectorizer.fit_transform(all_templates)
-        tfidf_dense = tfidf_matrix.toarray().astype(np.float32)
+        tfidf_vectorizer.fit(fit_corpus)
+        # Densify the *template table* (tens–hundreds of rows). Safe for HDFS/BGL
+        # (vocab ≪ 10k). A much larger vocabulary should stay sparse until each
+        # graph materialises its node matrix; see densify_tfidf_rows().
+        tfidf_matrix = tfidf_vectorizer.transform(all_templates)
+        n_features = int(tfidf_matrix.shape[1])
+        if n_features > TFIDF_DENSE_MAX_FEATURES:
+            logger.warning(
+                "TF-IDF vocabulary has %d features (> %d). Densifying the "
+                "template table anyway because GINE still needs dense node "
+                "rows; consider a hashed/sparse path for a larger corpus.",
+                n_features,
+                TFIDF_DENSE_MAX_FEATURES,
+            )
+        tfidf_dense = densify_tfidf_rows(tfidf_matrix)
         parts.append(tfidf_dense)
         logger.info(
-            "TF-IDF: %d-dim vectors for %d templates", tfidf_dense.shape[1], len(all_cids)
+            "TF-IDF: %d-dim vectors for %d templates (fitted on %d)",
+            tfidf_dense.shape[1],
+            len(all_cids),
+            len(fit_corpus),
         )
 
     # ── Sentence-BERT (semantic features on enriched text) ───────────────────
@@ -148,6 +190,18 @@ def compute_embeddings(
     return hybrid_embeddings, all_cids, tfidf_vectorizer
 
 
+def densify_tfidf_rows(matrix: Any) -> np.ndarray:
+    """Materialise TF-IDF rows as float32. Template tables stay small (n ≪ 1k).
+
+    GINEConv expects dense node features, so each template is densified here
+    rather than storing a (n_graphs × vocab) cube. Call this per template
+    table, not per log line.
+    """
+    if hasattr(matrix, "toarray"):
+        return np.asarray(matrix.toarray(), dtype=np.float32)
+    return np.asarray(matrix, dtype=np.float32)
+
+
 # ── Graph structure (embedding-agnostic) ──────────────────────────────────────
 
 
@@ -179,7 +233,9 @@ def build_graph_structures(
         mininterval=2.0,
     )
     for wid, seq in iterator:
-        label = block_labels.get(wid, 0)
+        if wid not in block_labels:
+            raise MissingSequenceLabel(wid)
+        label = int(block_labels[wid])
         try:
             structures.append(
                 _seq_to_structure(
@@ -384,6 +440,34 @@ def split_dataset(
     return idx_train, idx_val, idx_test
 
 
+def split_label_indices(
+    labels: np.ndarray,
+    seed: int = 42,
+    *,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stratified 70/15/15 split from a label vector (no PyG graphs required)."""
+    from sklearn.model_selection import train_test_split
+
+    labels = np.asarray(labels)
+    indices = np.arange(len(labels))
+    test_ratio = 1.0 - train_ratio - val_ratio
+    idx_train, idx_temp = train_test_split(
+        indices,
+        test_size=(1.0 - train_ratio),
+        random_state=seed,
+        stratify=labels,
+    )
+    idx_val, idx_test = train_test_split(
+        idx_temp,
+        test_size=test_ratio / (val_ratio + test_ratio),
+        random_state=seed,
+        stratify=labels[idx_temp],
+    )
+    return idx_train, idx_val, idx_test
+
+
 def save_graph_dataset(
     all_data: list,
     idx_train: np.ndarray,
@@ -425,6 +509,137 @@ def save_graph_dataset(
                 payload[key] = dataset_meta[key]
     torch.save(payload, path)
     logger.info("Graph dataset saved → %s  (%.1f MB)", path, path.stat().st_size / 1e6)
+    _save_graph_splits(
+        path,
+        all_data,
+        idx_train,
+        idx_val,
+        idx_test,
+        node_dim=node_dim,
+        edge_dim=edge_dim,
+        embed_dim=embed_dim,
+        dataset_meta=dataset_meta,
+    )
+
+
+def graph_split_dir(path: str | Path) -> Path:
+    """Directory of per-split shards next to ``graph_dataset.pt``."""
+    path = Path(path)
+    name = path.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    stem = Path(name).stem
+    return path.parent / f"{stem}_splits"
+
+
+def _save_graph_splits(
+    path: Path,
+    all_data: list,
+    idx_train: np.ndarray,
+    idx_val: np.ndarray,
+    idx_test: np.ndarray,
+    *,
+    node_dim: int,
+    edge_dim: int,
+    embed_dim: int,
+    dataset_meta: dict[str, Any] | None,
+) -> None:
+    """Write train/val/test lists so training need not ``torch.load`` every graph."""
+    import torch
+
+    split_dir = graph_split_dir(path)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "node_dim": node_dim,
+        "edge_dim": edge_dim,
+        "embed_dim": embed_dim,
+        "n_train": int(len(idx_train)),
+        "n_val": int(len(idx_val)),
+        "n_test": int(len(idx_test)),
+        "n_total": int(len(all_data)),
+    }
+    if dataset_meta:
+        meta["dataset_meta"] = dataset_meta
+    torch.save([all_data[int(i)] for i in idx_train], split_dir / "train.pt")
+    torch.save([all_data[int(i)] for i in idx_val], split_dir / "val.pt")
+    torch.save([all_data[int(i)] for i in idx_test], split_dir / "test.pt")
+    (split_dir / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+    logger.info("Graph splits saved → %s", split_dir)
+
+
+class GraphDirectoryDataset:
+    """Lazy ``__getitem__`` over one graph per ``*.pt`` file.
+
+    Unique-sequence HDFS (~17.6k) already avoids loading 575k blocks. Use this
+    only when training the full block set: write shards with
+    :func:`save_graph_directory`, then wrap each split directory. Metrics are
+    unchanged if the graphs themselves are identical.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory)
+        self.paths = sorted(self.directory.glob("*.pt"))
+        if not self.paths:
+            raise FileNotFoundError(f"No *.pt graphs in {self.directory}")
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int):
+        import torch
+
+        return torch.load(self.paths[index], weights_only=False, map_location="cpu")
+
+
+def save_graph_directory(graphs: list, directory: str | Path) -> Path:
+    """Write one ``{index:06d}.pt`` per graph for :class:`GraphDirectoryDataset`."""
+    import torch
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, graph in enumerate(graphs):
+        torch.save(graph, directory / f"{index:06d}.pt")
+    return directory
+
+
+def load_graph_splits(path: str | Path) -> tuple[list, list, list, dict[str, Any]]:
+    """Load train/val/test graphs without materialising the full list when shards exist.
+
+    Falls back to a single ``torch.load`` of ``data_list`` for older bundles.
+    Unique-sequence campaigns load three split lists (~17.6k total). A 575k
+    all-block run should use :class:`GraphDirectoryDataset` instead of one
+    ``torch.save`` list.
+    """
+    import torch
+
+    path = Path(path)
+    split_dir = graph_split_dir(path)
+    train_path = split_dir / "train.pt"
+    if train_path.exists() and (split_dir / "val.pt").exists() and (split_dir / "test.pt").exists():
+        train_graphs = torch.load(train_path, weights_only=False, map_location="cpu")
+        val_graphs = torch.load(split_dir / "val.pt", weights_only=False, map_location="cpu")
+        test_graphs = torch.load(split_dir / "test.pt", weights_only=False, map_location="cpu")
+        meta: dict[str, Any] = {}
+        meta_path = split_dir / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+        sidecar = path.with_name("dataset_meta.json")
+        if sidecar.exists():
+            meta.setdefault("dataset_meta", json.loads(sidecar.read_text()))
+        return list(train_graphs), list(val_graphs), list(test_graphs), meta
+
+    bundle = torch.load(path, weights_only=False, map_location="cpu")
+    all_data = bundle["data_list"]
+    train_graphs = [all_data[int(i)] for i in bundle["idx_train"]]
+    val_graphs = [all_data[int(i)] for i in bundle["idx_val"]]
+    test_graphs = [all_data[int(i)] for i in bundle["idx_test"]]
+    meta = {
+        "node_dim": bundle.get("node_dim"),
+        "edge_dim": bundle.get("edge_dim"),
+        "embed_dim": bundle.get("embed_dim"),
+        "dataset_meta": bundle.get("dataset_meta") or {},
+    }
+    return train_graphs, val_graphs, test_graphs, meta
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

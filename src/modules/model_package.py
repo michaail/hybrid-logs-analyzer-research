@@ -84,6 +84,7 @@ class PackageArchitecture(PackageModel):
     latent_dim: int = Field(gt=0)
     gine_aggregation: Literal["sum", "mean", "max"]
     node_transformation: Literal["mlp", "linear"]
+    structure_decoder: Literal["mlp", "inner_product"] = "inner_product"
     edge_mean: list[float] | None = None
     edge_std: list[float] | None = None
     feature_contract: Literal["notebook_raw_v1", "stabilized_v2"] = "stabilized_v2"
@@ -220,6 +221,15 @@ def expected_state_dict_spec(architecture: PackageArchitecture) -> dict[str, Ten
         "edge_decoder.2.weight": TensorSpec((edge_dim, hidden_dim), float_spec),
         "edge_decoder.2.bias": TensorSpec((edge_dim,), float_spec),
     }
+    if architecture.structure_decoder == "mlp":
+        spec.update(
+            {
+                "structure_decoder.0.weight": TensorSpec((hidden_dim, latent_dim * 2), float_spec),
+                "structure_decoder.0.bias": TensorSpec((hidden_dim,), float_spec),
+                "structure_decoder.2.weight": TensorSpec((1, hidden_dim), float_spec),
+                "structure_decoder.2.bias": TensorSpec((1,), float_spec),
+            }
+        )
     if architecture.node_transformation == "mlp":
         spec.update(
             {

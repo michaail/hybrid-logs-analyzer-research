@@ -19,11 +19,14 @@ Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT,
 ## Invariants
 
 - One Drain parse, one HDFS block sequencing, **one split lock** (`split_lock.npz`) shared by every Family A graph.
-- Family A does **not** rebuild collapsed topology seven times. Stage `stage45_graph_structure` caches per-block extras and 10-d edges keyed by dataset + `unique_sequences` + `feature_contract`. Embedding arms (`tfidf_only`, `sbert_only`, `no_llm_enrichment`, …) splice a new node matrix; `no_edge_features` keeps the first edge column. Only `feature_contract_stabilized_v2` needs a second structure pass.
+- Family A does **not** rebuild collapsed topology seven times. Stage `stage45_graph_structure` caches per-block extras and 10-d edges keyed by dataset + `unique_sequences` + `feature_contract` + `fit_on` + `split_protocol`. Embedding arms (`tfidf_only`, `sbert_only`, `no_llm_enrichment`, …) splice a new node matrix; `no_edge_features` keeps the first edge column. Only `feature_contract_stabilized_v2` needs a second structure pass.
 - HDFS Family A graphs are **unique template sequences** (`ablation.graph.unique_sequences: true`): one PyG graph per distinct ordered `cluster_id` list (~17.6k), not one per block (~575k). Parameters and time-delta edges come from a representative block; mixed-label fingerprints keep one normal and one anomalous example. This is **not comparable** to an all-block campaign — do not reuse a 575k `split_lock.npz`. Opt out with `--set ablation.graph.unique_sequences=false`.
 - Seed 42, clean-train, val-F1 threshold, report test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
 - LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Mistral large/small are not ablation arms.
 - Default `ablation.feature_contract: notebook_raw_v1` (thesis-comparable). `stabilized_v2` is an explicit Family A arm.
+- Default campaign protocol is **`inductive_v1`**: `ablation.representation.fit_on: train_only`, BGL `sequencing.bgl.split: time`, directed `structure_decoder: mlp`, fail-closed HDFS labels, `missing_embedding=fail`. Notebook / `hdfs_baseline.yaml` numbers are **`transductive_v1`** (Drain+TF-IDF fit on the full log, random window split, inner-product structure). Do **not** mix `split_lock.npz` / `graph_dataset.pt.gz` across protocols or compare PR-AUC between them.
+- New campaigns need a new id. Keep `hdfs_ablation_20260916` / notebook ROC-AUC 0.976 as the transductive ceiling. Suggested inductive ids: `hdfs_inductive_v1_20260918`, `bgl_inductive_v1_20260918`.
+- Structure component AUC in PROCESS.md (~0.52) used batch-level negatives, a symmetric decoder, and positive-only eval scores. After the GAE restore, report structure/node/edge AUCs **before vs after** that change; do not treat a move away from 0.52 as a regression against the notebook.
 - Do not mix sentence-transformers versions inside one dataset campaign. HDFS stays local (ST 2.2.2). A BGL campaign is either fully local (ST 2.2.2) or fully Colab-prepared (ST 5.x via `RUN_PREPARE`). Train-only consumes frozen tensors.
 - Never train from the Drive mount. Stage `.pt.gz` → `/content/workspace`, decompress there.
 - Pin `GIT_REF` for the Colab clone; do not `git pull` mid-campaign. Cache fingerprints no longer include git SHA (SHA still lands on run manifests).
@@ -34,7 +37,7 @@ From this repository root, Intel Mac PyTorch/PyG plus `requirements.txt`, Azure 
 
 ```bash
 python scripts/prepare_hdfs_campaign.py \
-  --campaign-id hdfs_ablation_20260916 \
+  --campaign-id hdfs_inductive_v1_20260918 \
   --workspace-root /path/to/workspace \
   --set experiment.dataset=hdfs
 ```
@@ -43,7 +46,7 @@ Equivalent:
 
 ```bash
 python run_ablation.py --mode prepare-campaign \
-  --campaign-id hdfs_ablation_20260916 \
+  --campaign-id hdfs_inductive_v1_20260918 \
   --workspace-root /path/to/workspace \
   --set experiment.dataset=hdfs
 ```
@@ -109,13 +112,13 @@ hybrid-log-analyzer-artifacts/
 
 ## BGL
 
-Same two-family protocol as HDFS. Graphs are disjoint 20-minute windows (**all windows**, not unique-sequence dedup). Do not use overlapping windows with the random stratified graph split: adjacent windows would share raw log records across train, validation, and test. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
+Same two-family protocol as HDFS. Graphs are **time-cut then windowed** (`sequencing.bgl.split: time`): train/val/test event slices are chosen first, then 20-minute windows are built **inside** each slice (`step_minutes` may equal `window_minutes` or overlap; overlap never crosses a cut). Do not reuse a random-window `split_lock.npz`. Family A YAML is `configs/ablation_representation_bgl.yaml` (no `feature_contract_stabilized_v2`). LLM enrichment is **Deepseek v4 Pro only**.
 
-Published campaign metrics require `SMOKE=False` (25 epochs and complete splits). A smoke run uses one epoch and at most 5,000 graphs per split and is only a pipeline diagnostic. Use a new campaign ID when replacing an already published smoke campaign.
+Published campaign metrics require `SMOKE=False` (25 epochs and complete splits). A smoke run uses one epoch and at most 5,000 graphs per split and is only a pipeline diagnostic. Use a new campaign ID when replacing an already published smoke campaign. Transductive notebook BGL numbers (overlapping windows + random split) are not comparable.
 
 ```bash
 python scripts/prepare_bgl_campaign.py \
-  --campaign-id bgl_ablation_20260917 \
+  --campaign-id bgl_inductive_v1_20260918 \
   --workspace-root /path/to/workspace
 ```
 
@@ -123,7 +126,7 @@ Equivalent:
 
 ```bash
 python run_ablation.py --mode prepare-campaign \
-  --campaign-id bgl_ablation_20260917 \
+  --campaign-id bgl_inductive_v1_20260918 \
   --workspace-root /path/to/workspace \
   --set experiment.dataset=bgl \
   --matrix configs/ablation_representation_bgl.yaml

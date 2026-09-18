@@ -185,11 +185,14 @@ def sequence_fingerprint(seq: pd.DataFrame) -> str:
 def select_unique_sequences(
     sequences: dict,
     labels: dict,
+    *,
+    prefer_ids: set | None = None,
 ) -> tuple[dict, dict, dict[str, int]]:
     """Keep one sequence per ordered-template fingerprint (and label, if mixed).
 
     The representative for each ``(fingerprint, label)`` pair is the first
-    sequence id in sorted string order. Fingerprints that appear with both
+    sequence id in sorted string order, unless ``prefer_ids`` is given (train
+    block ids under inductive_v1). Fingerprints that appear with both
     normal and anomalous labels keep one example of each class.
 
     Returns
@@ -198,23 +201,33 @@ def select_unique_sequences(
         ``stats`` has ``n_raw``, ``n_unique``, and ``n_mixed_label_fingerprints``.
     """
     grouped: dict[str, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    missing = [sequence_id for sequence_id in sequences if sequence_id not in labels]
+    if missing:
+        preview = ", ".join(str(item) for item in missing[:5])
+        raise KeyError(
+            f"{len(missing)} sequence(s) have no label (e.g. {preview}). "
+            "Refusing to treat unlabeled sequences as normal."
+        )
     for sequence_id in sorted(sequences, key=lambda sid: str(sid)):
         fingerprint = sequence_fingerprint(sequences[sequence_id])
-        label = int(labels.get(sequence_id, 0))
+        label = int(labels[sequence_id])
         grouped[fingerprint][label].append(sequence_id)
 
+    preferred = {str(item) for item in (prefer_ids or [])}
     selected_ids: list = []
     n_mixed = 0
     for by_label in grouped.values():
         if len(by_label) > 1:
             n_mixed += 1
         for label in sorted(by_label):
-            selected_ids.append(by_label[label][0])
+            candidates = by_label[label]
+            chosen = next((sid for sid in candidates if str(sid) in preferred), candidates[0])
+            selected_ids.append(chosen)
 
     selected_ids.sort(key=lambda sid: str(sid))
     unique_sequences = {sequence_id: sequences[sequence_id] for sequence_id in selected_ids}
     unique_labels = {
-        sequence_id: int(labels.get(sequence_id, 0)) for sequence_id in selected_ids
+        sequence_id: int(labels[sequence_id]) for sequence_id in selected_ids
     }
     stats = {
         "n_raw": len(sequences),

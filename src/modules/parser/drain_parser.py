@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from collections import defaultdict
 from pathlib import Path
 import json
@@ -15,6 +15,10 @@ class UnmatchedLogLine(ValueError):
   def __init__(self, line_number: int) -> None:
     self.line_number = line_number
     super().__init__(f"Log line {line_number} did not match a frozen template.")
+
+
+OOV_CLUSTER_ID = -1
+OOV_TEMPLATE = "<*>"
 
 
 class DrainParser:
@@ -77,14 +81,27 @@ class DrainParser:
     self.line_template_ids: List[str] = []
 
 
-  def fit_file(self, log_path: str, max_lines: int | None = None) -> None:
+  def fit_file(
+    self,
+    log_path: str,
+    max_lines: int | None = None,
+    *,
+    include_line: Callable[[str], bool] | None = None,
+  ) -> None:
     log_file = Path(log_path)
     print(f"[INFO] Training Drain3 on: {log_file}")
+    n_skipped = 0
 
     with log_file.open("r", errors="replace") as f:
       for i, raw in enumerate(f, start=1):
         line = raw.rstrip("\n")
         if not line:
+          continue
+        if include_line is not None and not include_line(line):
+          n_skipped += 1
+          if max_lines is not None and i >= max_lines:
+            print(f"[INFO] Stopped early at {max_lines} lines")
+            break
           continue
 
         content = self._preprocess_line(line, self._HEADER_TOKENS)
@@ -109,6 +126,8 @@ class DrainParser:
           print(f"[INFO] Processed {i} lines...")
 
       print(f"[INFO] Parsed {len(self.line_template_ids)} log lines total.")
+      if n_skipped:
+        print(f"[INFO] Skipped {n_skipped} lines (held-out split; not used to grow Drain).")
       print(f"[INFO] Learned {len(self.miner.drain.id_to_cluster)} distinct templates (final).")
 
 
@@ -169,14 +188,17 @@ class DrainParser:
 
     Returns a pandas DataFrame with one row per log line. Column schema is
     determined by :meth:`_extract_row` (overridable by subclasses).
-    ``unmatched="fail"`` raises :class:`UnmatchedLogLine` instead of skipping.
+    ``unmatched="fail"`` raises :class:`UnmatchedLogLine`.
+    ``unmatched="oov"`` assigns :data:`OOV_CLUSTER_ID` (never seen in a
+    train-only Drain fit).
     """
-    if unmatched not in {"skip", "fail"}:
-      raise ValueError("unmatched must be 'skip' or 'fail'.")
+    if unmatched not in {"skip", "fail", "oov"}:
+      raise ValueError("unmatched must be 'skip', 'fail', or 'oov'.")
     import pandas as pd
 
     rows = []
     log_file = Path(log_path)
+    n_oov = 0
 
     with log_file.open("r", errors="replace") as f:
       for i, raw in enumerate(f, start=1):
@@ -192,6 +214,14 @@ class DrainParser:
         if match is None:
           if unmatched == "fail":
             raise UnmatchedLogLine(i)
+          if unmatched == "skip":
+            continue
+          row = self._extract_row(line, OOV_CLUSTER_ID, OOV_TEMPLATE, [])
+          row["line_number"] = i
+          rows.append(row)
+          n_oov += 1
+          if max_lines is not None and i >= max_lines:
+            break
           continue
 
         template_tokens = match.get_template()  # list[str]
@@ -209,7 +239,11 @@ class DrainParser:
           print(f"[INFO] Annotated {i} lines...")
 
     print(f"[INFO] Annotated {len(rows)} lines.")
-    return pd.DataFrame(rows)
+    if n_oov:
+      print(f"[INFO] Assigned OOV cluster {OOV_CLUSTER_ID} to {n_oov} unmatched lines.")
+    frame = pd.DataFrame(rows)
+    frame.attrs["n_oov"] = n_oov
+    return frame
 
 
   def export_templates(self, out_path: str) -> None:

@@ -29,6 +29,7 @@ sequencing:
   bgl:
     window_minutes: 20
     step_minutes: 10
+    split: stratified
 
 inference_release:
   # This selected run was trained by 5_PrepareDataset.ipynb, before the
@@ -39,6 +40,8 @@ ablation:
   llm_enrichment_enabled: true
   enrichment_model_size: large
   feature_contract: notebook_raw_v1
+  representation:
+    fit_on: all
   embeddings:
     tfidf_enabled: true
     sbert_enabled: true
@@ -47,6 +50,7 @@ ablation:
     unique_sequences: false
     gine_aggregation: sum
     node_transformation: mlp
+    structure_decoder: inner_product
 
 training:
   train_mode: clean

@@ -27,6 +27,8 @@ LEGACY_GRAPH_IDENTITY: dict[str, Any] = {
     "use_edge_features": True,
     "feature_contract": "notebook_raw_v1",
     "unique_sequences": False,
+    "fit_on": "all",
+    "split_protocol": "stratified",
 }
 
 GRAPH_IDENTITY_KEYS = tuple(LEGACY_GRAPH_IDENTITY.keys())
@@ -56,6 +58,43 @@ def unique_sequences_from_config(config: Mapping[str, Any]) -> bool:
     return bool(graph.get("unique_sequences", True))
 
 
+def fit_on_from_config(config: Mapping[str, Any]) -> str:
+    """``all`` (transductive Drain+TF-IDF) or ``train_only`` (inductive_v1).
+
+    Missing YAML keys stay ``all`` so older configs (notebook parity) do not
+    silently change protocol.
+    """
+    representation = ((config.get("ablation") or {}).get("representation")) or {}
+    value = str(representation.get("fit_on") or "all").lower()
+    if value not in {"all", "train_only"}:
+        raise ValueError(f"ablation.representation.fit_on must be 'all' or 'train_only', got {value!r}")
+    return value
+
+
+def split_protocol_from_config(config: Mapping[str, Any]) -> str:
+    """Graph/window split protocol. HDFS is always block-stratified."""
+    experiment = config.get("experiment") or {}
+    dataset = str(experiment.get("dataset") or "bgl").lower()
+    if dataset != "bgl":
+        return "stratified"
+    sequencing = (config.get("sequencing") or {}).get("bgl") or {}
+    value = str(sequencing.get("split") or "stratified").lower()
+    if value not in {"time", "stratified"}:
+        raise ValueError(f"sequencing.bgl.split must be 'time' or 'stratified', got {value!r}")
+    return value
+
+
+def structure_decoder_from_config(config: Mapping[str, Any]) -> str:
+    """Directed concat-MLP (default) or symmetric inner product."""
+    graph = ((config.get("ablation") or {}).get("graph")) or {}
+    value = str(graph.get("structure_decoder") or "mlp").lower()
+    if value not in {"mlp", "inner_product"}:
+        raise ValueError(
+            f"ablation.graph.structure_decoder must be 'mlp' or 'inner_product', got {value!r}"
+        )
+    return value
+
+
 def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return the representation knobs that require a distinct graph bundle."""
     ablation = config["ablation"]
@@ -71,6 +110,8 @@ def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "use_edge_features": bool(graph.get("use_edge_features", True)),
         "feature_contract": feature_contract_from_config(config),
         "unique_sequences": unique_sequences_from_config(config),
+        "fit_on": fit_on_from_config(config),
+        "split_protocol": split_protocol_from_config(config),
     }
 
 
@@ -102,6 +143,8 @@ def graph_identity_from_meta(meta: Mapping[str, Any] | None) -> dict[str, Any] |
             "use_edge_features": bool(meta.get("use_edge_features", True)),
             "feature_contract": str(meta.get("feature_contract", "notebook_raw_v1")),
             "unique_sequences": _unique_sequences_from_meta(meta),
+            "fit_on": str(_identity_field_from_meta(meta, "fit_on", "all")),
+            "split_protocol": str(_identity_field_from_meta(meta, "split_protocol", "stratified")),
         }
     )
 
@@ -115,10 +158,21 @@ def _unique_sequences_from_meta(meta: Mapping[str, Any]) -> bool:
     return False
 
 
+def _identity_field_from_meta(meta: Mapping[str, Any], key: str, default: Any) -> Any:
+    if key in meta and meta[key] is not None:
+        return meta[key]
+    nested = meta.get("graph_identity")
+    if isinstance(nested, Mapping) and nested.get(key) is not None:
+        return nested[key]
+    return default
+
+
 def _complete_graph_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Fill identity keys; missing ``unique_sequences`` is the all-block baseline."""
+    """Fill identity keys; missing protocol fields are the transductive baseline."""
     identity = {key: raw.get(key) for key in GRAPH_IDENTITY_KEYS}
     identity["unique_sequences"] = bool(raw.get("unique_sequences", False))
+    identity["fit_on"] = str(raw.get("fit_on") or "all")
+    identity["split_protocol"] = str(raw.get("split_protocol") or "stratified")
     return identity
 
 

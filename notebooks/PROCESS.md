@@ -563,6 +563,14 @@ Insights:
 (setting α=0) would likely *improve* results by removing the gradient noise
 it adds to the encoder — this is a prime candidate for the next ablation.
 
+That 0.52 structure ROC-AUC is **not** a regression target for `inductive_v1`.
+It was measured with batch-union negative sampling, a symmetric inner-product
+decoder, and eval scores on **observed edges only**. The restored GAE
+(`src/modules/models/gae.py`) uses per-graph negatives, a directed concat-MLP
+decoder (Family B still has `inner_product_structure`), and in-graph non-edges
+at val/test. Compare component AUCs **within** a protocol; notebook ROC-AUC
+0.976 remains a transductive ceiling.
+
 ### 6.7 Data-leakage verification
 
 Section 11 explicitly checks:

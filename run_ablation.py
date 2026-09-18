@@ -40,6 +40,7 @@ from src.modules.ablation import (
     experiment_requires_graph_rebuild,
     feature_contract_from_config,
     file_digest,
+    fit_on_from_config,
     graph_identity_from_config,
     gunzip_file,
     gzip_file,
@@ -48,6 +49,8 @@ from src.modules.ablation import (
     load_split_lock,
     save_split_lock,
     sequence_ids_from_graphs,
+    split_protocol_from_config,
+    structure_decoder_from_config,
     unique_sequences_from_config,
     write_campaign_manifest,
     write_campaign_report,
@@ -59,10 +62,13 @@ from src.modules.dataset import (
     attach_cluster_embeddings,
     build_graph_structures,
     compute_embeddings,
+    graph_split_dir,
+    load_graph_splits,
     load_graph_structures,
     save_graph_dataset,
     save_graph_structures,
     split_dataset,
+    split_label_indices,
 )
 from src.modules.enrichment import enrich_templates, load_enriched_templates
 from src.modules.graph_builder import select_unique_sequences
@@ -71,8 +77,22 @@ from src.modules.inference_release import (
     HdfsReleaseSource,
     export_hdfs_inference_release,
 )
-from src.modules.parser import BGLParser, DrainParser
-from src.modules.sequencer import build_sequences, load_sequences, save_sequences
+from src.modules.parser import BGLParser, DrainParser, OOV_CLUSTER_ID, OOV_TEMPLATE
+from src.modules.sequencer import (
+    build_sequences,
+    load_sequences,
+    save_sequences,
+    split_indices_from_bgl_windows,
+)
+from src.modules.unit_split import (
+    bgl_first_n_line_filter,
+    bgl_train_line_count,
+    hdfs_train_line_filter,
+    indices_from_unit_split,
+    save_unit_split,
+    scan_hdfs_block_ids,
+    stratified_id_split,
+)
 from src.modules.utils import get_device, seed_everything
 
 # Embedding-agnostic graph structures, reused across Family A arms in one process.
@@ -192,11 +212,19 @@ def stage3_sequence(
     stage1 = _stage1_artifacts(config, workspace_root=workspace, code_root=code)
     store = ArtifactStore(workspace, dataset, code)
     sequencing = config.get("sequencing", {}).get(dataset, {})
-    stage_config = {"dataset": dataset, **sequencing}
+    split_protocol = split_protocol_from_config(config)
+    stage_config = {
+        "dataset": dataset,
+        **sequencing,
+        "split_protocol": split_protocol,
+        "fit_on": fit_on_from_config(config),
+    }
 
     def build(temp_dir: Path) -> dict[str, Path]:
         frame = _read_parquet(stage1["annotated"])
-        sequences = build_sequences(frame, dataset, **sequencing)
+        kwargs = dict(sequencing)
+        kwargs["split"] = split_protocol
+        sequences = build_sequences(frame, dataset, **kwargs)
         if not sequences:
             raise ValueError(f"No {dataset.upper()} sequences were built from {stage1['annotated']}")
         flat_sequences = pd.concat(sequences.values(), ignore_index=True)
@@ -257,11 +285,73 @@ def stage45_build_dataset(
             labels_path,
             store=store,
         )
+        sequence_ids = [str(item["seq_id"]) for item in structures]
+        unit_split_path = _stage1_artifacts(config, workspace_root=workspace, code_root=code).get(
+            "unit_split"
+        )
+        if lock_path is not None:
+            idx_train, idx_val, idx_test = apply_split_lock(
+                structures,
+                load_split_lock(lock_path),
+                sequence_ids=sequence_ids,
+            )
+            lock_id = load_split_lock(lock_path)["split_lock_id"]
+        elif split_protocol_from_config(config) == "time":
+            idx_train, idx_val, idx_test = split_indices_from_bgl_windows(sequence_ids)
+            lock_id = save_split_lock(
+                temp_dir / "split_lock.npz",
+                idx_train,
+                idx_val,
+                idx_test,
+                sequence_ids=sequence_ids,
+                seed=int(config["experiment"]["seed"]),
+            )
+        elif fit_on_from_config(config) == "train_only" and unit_split_path is not None:
+            unit_split = json.loads(Path(unit_split_path).read_text())
+            if unit_split.get("kind") == "hdfs_blocks":
+                idx_train, idx_val, idx_test = indices_from_unit_split(sequence_ids, unit_split)
+                lock_id = save_split_lock(
+                    temp_dir / "split_lock.npz",
+                    idx_train,
+                    idx_val,
+                    idx_test,
+                    sequence_ids=sequence_ids,
+                    seed=int(config["experiment"]["seed"]),
+                )
+            else:
+                idx_train = idx_val = idx_test = lock_id = None
+        else:
+            idx_train = idx_val = idx_test = lock_id = None
+
+        if idx_train is None:
+            ys = np.array([int(item["y"]) for item in structures])
+            idx_train, idx_val, idx_test = split_label_indices(
+                ys, seed=int(config["experiment"]["seed"])
+            )
+            lock_id = save_split_lock(
+                temp_dir / "split_lock.npz",
+                idx_train,
+                idx_val,
+                idx_test,
+                sequence_ids=sequence_ids,
+                seed=int(config["experiment"]["seed"]),
+            )
+
+        tfidf_fit_texts = None
+        if fit_on_from_config(config) == "train_only":
+            train_cids: set[int] = set()
+            for index in idx_train:
+                train_cids.update(int(cid) for cid in structures[int(index)]["cluster_ids"])
+            cid_to_template = {int(item["cluster_id"]): item["template"] for item in templates}
+            tfidf_fit_texts = [
+                cid_to_template[cid] for cid in sorted(train_cids) if cid in cid_to_template
+            ]
         embeddings, cluster_ids, _ = compute_embeddings(
             templates,
             cluster_to_enriched,
             tfidf_enabled=bool(ablation["embeddings"]["tfidf_enabled"]),
             sbert_enabled=bool(ablation["embeddings"]["sbert_enabled"]),
+            tfidf_fit_texts=tfidf_fit_texts,
         )
         cluster_embeddings = {
             cluster_id: embedding
@@ -275,30 +365,12 @@ def stage45_build_dataset(
             structures,
             cluster_embeddings,
             use_edge_features=bool(ablation["graph"]["use_edge_features"]),
+            missing_embedding="fail",
         )
         if not data_list:
             raise ValueError("Graph builder produced no examples.")
-        print(f"[GRAPH] built {len(data_list)} graphs; splitting and saving", flush=True)
+        print(f"[GRAPH] built {len(data_list)} graphs; saving", flush=True)
         sequence_ids = sequence_ids_from_graphs(data_list)
-        if lock_path is not None:
-            idx_train, idx_val, idx_test = apply_split_lock(
-                data_list,
-                load_split_lock(lock_path),
-                sequence_ids=sequence_ids,
-            )
-            lock_id = load_split_lock(lock_path)["split_lock_id"]
-        else:
-            idx_train, idx_val, idx_test = split_dataset(
-                data_list, seed=int(config["experiment"]["seed"])
-            )
-            lock_id = save_split_lock(
-                temp_dir / "split_lock.npz",
-                idx_train,
-                idx_val,
-                idx_test,
-                sequence_ids=sequence_ids,
-                seed=int(config["experiment"]["seed"]),
-            )
         node_dim = int(data_list[0].x.shape[1])
         edge_dim = int(data_list[0].edge_attr.shape[1])
         meta = {
@@ -387,6 +459,7 @@ def stage6_train(
             seed=int(config["experiment"]["seed"]),
             gine_aggregation=str(ablation_graph["gine_aggregation"]),
             node_transformation=str(ablation_graph["node_transformation"]),
+            structure_decoder=structure_decoder_from_config(config),
         )
         metrics_path = temp_dir / "metrics.json"
         metrics_path.write_text(json.dumps({k: v for k, v in metrics.items() if k != "history_epochs"}, indent=2))
@@ -706,11 +779,19 @@ def _stage1_artifacts(
     raw_path = workspace / config["paths"]["raw_dir"] / parser_settings["raw_file"]
     parser_config = code / parser_settings["config"]
     store = ArtifactStore(workspace, dataset, code)
+    fit_on = fit_on_from_config(config)
+    labels_path = _hdfs_labels_path(workspace, config) if dataset == "hdfs" else None
     stage_config = {
         "dataset": dataset,
         "parser_config": parser_settings["config"],
         "raw_file": parser_settings["raw_file"],
+        "fit_on": fit_on,
+        "seed": int(config["experiment"]["seed"]),
+        "split_protocol": split_protocol_from_config(config),
     }
+    inputs = [raw_path, parser_config]
+    if dataset == "hdfs" and fit_on == "train_only":
+        inputs.append(labels_path)
 
     def build(temp_dir: Path) -> dict[str, Path]:
         parser_cls = BGLParser if dataset == "bgl" else DrainParser
@@ -719,23 +800,68 @@ def _stage1_artifacts(
             config_path=str(parser_config),
             persistence_path=str(state_path),
         )
-        parser.fit_file(str(raw_path))
-        frame = parser.annotate_file(str(raw_path))
+        include_line = None
+        unit_payload: dict[str, Any] | None = None
+        unmatched = "skip"
+        if fit_on == "train_only":
+            unmatched = "oov"
+            if dataset == "hdfs":
+                if labels_path is None or not labels_path.exists():
+                    raise FileNotFoundError(
+                        "HDFS train_only Drain fit requires anomaly_label.csv."
+                    )
+                block_ids = scan_hdfs_block_ids(raw_path)
+                mapping = _hdfs_label_mapping(labels_path)
+                unit_payload = {
+                    "kind": "hdfs_blocks",
+                    **stratified_id_split(
+                        block_ids,
+                        mapping,
+                        seed=int(config["experiment"]["seed"]),
+                    ),
+                }
+                include_line = hdfs_train_line_filter({str(item) for item in unit_payload["train"]})
+            else:
+                n_train = bgl_train_line_count(raw_path)
+                unit_payload = {"kind": "bgl_event_index", "n_train": n_train}
+                include_line = bgl_first_n_line_filter(n_train)
+        parser.fit_file(str(raw_path), include_line=include_line)
+        frame = parser.annotate_file(str(raw_path), unmatched=unmatched)
         templates_path = temp_dir / "templates.json"
         parser.export_templates(str(templates_path))
+        n_oov = 0
+        if "cluster_id" in frame.columns:
+            n_oov = int((frame["cluster_id"] == OOV_CLUSTER_ID).sum())
+        if n_oov:
+            with templates_path.open() as handle:
+                records = json.load(handle)
+            records.append(
+                {
+                    "cluster_id": OOV_CLUSTER_ID,
+                    "template": OOV_TEMPLATE,
+                    "count": n_oov,
+                    "examples": [],
+                }
+            )
+            templates_path.write_text(json.dumps(records, indent=2))
         parser.save()
         annotated_path = temp_dir / "annotated.parquet"
         _write_parquet(frame, annotated_path)
-        return {
+        outputs = {
             "annotated": annotated_path,
             "templates": templates_path,
             "parser_state": state_path,
         }
+        if unit_payload is not None:
+            unit_path = temp_dir / "unit_split.json"
+            save_unit_split(unit_path, unit_payload)
+            outputs["unit_split"] = unit_path
+        return outputs
 
     outputs, _, reused = store.stage(
         stage="stage1_parse",
         stage_config=stage_config,
-        inputs=[raw_path, parser_config],
+        inputs=[path for path in inputs if path is not None],
         build=build,
     )
     _announce("stage1_parse", reused)
@@ -749,6 +875,7 @@ def _train_graph_bundle(
     seed: int,
     gine_aggregation: str,
     node_transformation: str,
+    structure_decoder: str,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     import torch
     from sklearn.metrics import (
@@ -767,11 +894,15 @@ def _train_graph_bundle(
 
     seed_everything(seed)
     device = get_device()
-    bundle = torch.load(graph_path, weights_only=False, map_location="cpu")
-    all_data = bundle["data_list"]
-    train_graphs = [all_data[int(index)] for index in bundle["idx_train"]]
-    val_graphs = [all_data[int(index)] for index in bundle["idx_val"]]
-    test_graphs = [all_data[int(index)] for index in bundle["idx_test"]]
+    train_graphs, val_graphs, test_graphs, split_meta = load_graph_splits(graph_path)
+    node_dim = int(split_meta.get("node_dim") or 0)
+    edge_dim = int(split_meta.get("edge_dim") or 0)
+    if not node_dim or not edge_dim:
+        import torch
+
+        bundle = torch.load(graph_path, weights_only=False, map_location="cpu")
+        node_dim = int(bundle["node_dim"])
+        edge_dim = int(bundle["edge_dim"])
     if training["train_mode"] == "clean":
         train_graphs = [graph for graph in train_graphs if graph.y.item() == 0]
     if not train_graphs:
@@ -796,12 +927,13 @@ def _train_graph_bundle(
     test_loader = DataLoader(test_graphs, batch_size=batch_size)
 
     model = AttributeAwareGAE(
-        node_dim=int(bundle["node_dim"]),
-        edge_dim=int(bundle["edge_dim"]),
+        node_dim=int(node_dim),
+        edge_dim=int(edge_dim),
         hidden_dim=int(training["hidden_dim"]),
         latent_dim=int(training["latent_dim"]),
         gine_aggregation=gine_aggregation,
         node_transformation=node_transformation,
+        structure_decoder=structure_decoder,
     ).to(device)
     optimizer = Adam(model.parameters(), lr=float(training["learning_rate"]))
     loss_args = {
@@ -875,8 +1007,8 @@ def _train_graph_bundle(
     }
     checkpoint = {
         "model_state_dict": best_state,
-        "node_dim": int(bundle["node_dim"]),
-        "edge_dim": int(bundle["edge_dim"]),
+        "node_dim": int(node_dim),
+        "edge_dim": int(edge_dim),
         "hidden_dim": int(training["hidden_dim"]),
         "latent_dim": int(training["latent_dim"]),
         "best_threshold": best_threshold,
@@ -886,6 +1018,7 @@ def _train_graph_bundle(
         "edge_std": edge_std,
         "gine_aggregation": gine_aggregation,
         "node_transformation": node_transformation,
+        "structure_decoder": structure_decoder,
     }
     metrics["history"] = _loss_history(history)
     eval_payload = {
@@ -983,6 +1116,25 @@ def _sequence_labels(
         raise FileNotFoundError(
             "HDFS requires data/raw/hdfs/anomaly_label.csv for reproducible labels."
         )
+    mapping = _hdfs_label_mapping(labels_path)
+    missing = [sequence_id for sequence_id in sequences if str(sequence_id) not in mapping]
+    if missing:
+        preview = ", ".join(str(item) for item in missing[:5])
+        raise KeyError(
+            f"{len(missing)} HDFS sequence(s) are missing from {labels_path} "
+            f"(e.g. {preview}). Refusing to treat unlabeled blocks as normal."
+        )
+    return {sequence_id: mapping[str(sequence_id)] for sequence_id in sequences}
+
+
+def _to_binary_label(value: Any) -> int:
+    if isinstance(value, str):
+        return int(value.strip().lower() in {"1", "true", "anomaly", "anomalous"})
+    return int(bool(value))
+
+
+def _hdfs_label_mapping(labels_path: Path) -> dict[str, int]:
+    """Load BlockId → {0,1} from LogHub anomaly_label.csv."""
     labels_frame = pd.read_csv(labels_path)
     columns = {column.lower(): column for column in labels_frame.columns}
     id_column = next(
@@ -995,17 +1147,10 @@ def _sequence_labels(
         raise ValueError(
             f"Expected BlockId and Label columns in {labels_path}; found {list(labels_frame.columns)}"
         )
-    mapping = {
+    return {
         str(row[id_column]): _to_binary_label(row[label_column])
         for _, row in labels_frame.iterrows()
     }
-    return {sequence_id: mapping.get(str(sequence_id), 0) for sequence_id in sequences}
-
-
-def _to_binary_label(value: Any) -> int:
-    if isinstance(value, str):
-        return int(value.strip().lower() in {"1", "true", "anomaly", "anomalous"})
-    return int(bool(value))
 
 
 def _read_parquet(path: Path) -> pd.DataFrame:
@@ -1080,6 +1225,8 @@ def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
         "enrichment_backend": "deepseek-v4-pro" if ablation.get("llm_enrichment_enabled") else None,
         "feature_contract": feature_contract_from_config(config),
         "unique_sequences": unique_sequences_from_config(config),
+        "fit_on": fit_on_from_config(config),
+        "split_protocol": split_protocol_from_config(config),
     }
 
 
@@ -1089,6 +1236,8 @@ def _stage45_structure_config(config: dict[str, Any]) -> dict[str, Any]:
         "dataset": _dataset(config),
         "unique_sequences": unique_sequences_from_config(config),
         "feature_contract": feature_contract_from_config(config),
+        "split_protocol": split_protocol_from_config(config),
+        "fit_on": fit_on_from_config(config),
     }
 
 
@@ -1106,6 +1255,18 @@ def _ensure_graph_structures(
     if dataset == "hdfs":
         inputs.append(Path(labels_path).resolve())
     stage_config = _stage45_structure_config(config)
+    prefer_ids: set[str] | None = None
+    if fit_on_from_config(config) == "train_only":
+        stage1 = _stage1_artifacts(
+            config,
+            workspace_root=store.workspace_root,
+            code_root=store.code_root,
+        )
+        unit_split_path = stage1.get("unit_split")
+        if unit_split_path is not None:
+            inputs.append(Path(unit_split_path).resolve())
+            unit_split = json.loads(Path(unit_split_path).read_text())
+            prefer_ids = {str(item) for item in unit_split.get("train", [])}
     built: dict[str, tuple[list, dict[str, Any]]] = {}
 
     def build(temp_dir: Path) -> dict[str, Path]:
@@ -1121,7 +1282,9 @@ def _ensure_graph_structures(
             "n_mixed_label_fingerprints": 0,
         }
         if unique_sequences_from_config(config):
-            sequences, labels, unique_stats = select_unique_sequences(sequences, labels)
+            sequences, labels, unique_stats = select_unique_sequences(
+                sequences, labels, prefer_ids=prefer_ids
+            )
             print(
                 f"[GRAPH] unique sequences: {unique_stats['n_unique']} / "
                 f"{unique_stats['n_raw']} "
@@ -1200,6 +1363,7 @@ def _stage6_config(config: dict[str, Any]) -> dict[str, Any]:
         "training": _resolved_training(config, dataset),
         "gine_aggregation": ablation_graph["gine_aggregation"],
         "node_transformation": ablation_graph["node_transformation"],
+        "structure_decoder": structure_decoder_from_config(config),
     }
 
 
@@ -1224,6 +1388,19 @@ def _resolved_training(config: dict[str, Any], dataset: str) -> dict[str, Any]:
     return training
 
 
+def _copy_graph_splits(source_graph: Path, dest_graph: Path) -> None:
+    """Copy optional per-split shards next to an unpacked graph_dataset.pt."""
+    source_dir = source_graph.parent / "graph_dataset_splits"
+    if not source_dir.exists():
+        source_dir = graph_split_dir(source_graph)
+    if not source_dir.exists():
+        return
+    destination = graph_split_dir(dest_graph)
+    if destination.resolve() == source_dir.resolve():
+        return
+    shutil.copytree(source_dir, destination, dirs_exist_ok=True)
+
+
 def _resolve_graph_dataset(
     workspace: Path,
     *,
@@ -1237,6 +1414,7 @@ def _resolve_graph_dataset(
             unpacked = gunzip_file(path)
             if sidecar.exists():
                 shutil.copy2(sidecar, unpacked.with_name("dataset_meta.json"))
+            _copy_graph_splits(path, unpacked)
             path = unpacked
     elif input_run_id:
         manifest = workspace / "artifacts" / "runs" / f"{_safe_name(input_run_id)}.json"
@@ -1246,7 +1424,9 @@ def _resolve_graph_dataset(
     else:
         raise ValueError("train-only mode requires --graph-dataset or --input-run-id.")
     if path.suffix == ".gz":
-        path = gunzip_file(path)
+        unpacked = gunzip_file(path)
+        _copy_graph_splits(path, unpacked)
+        path = unpacked
     if not path.exists():
         raise FileNotFoundError(f"Graph dataset does not exist: {path}")
     return path
@@ -1476,6 +1656,9 @@ def prepare_representation_campaign(
         meta_source = cache_dir / "dataset_meta.json"
         if meta_source.exists():
             shutil.copy2(meta_source, bundle_dir / "dataset_meta.json")
+        split_source = graph_split_dir(graph_path)
+        if split_source.exists():
+            shutil.copytree(split_source, bundle_dir / "graph_dataset_splits", dirs_exist_ok=True)
         graphs.append(
             {
                 "name": name,

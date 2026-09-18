@@ -1,38 +1,23 @@
 """Attribute-Aware Graph Autoencoder (AttributeAwareGAE).
 
-Architecture extracted from ``6_GAE_Training_BGL_fixed.ipynb``:
+Architecture extracted from ``6_GAE_Training_BGL_fixed.ipynb`` and corrected
+so structure reconstruction matches a *directed*, *per-graph* adjacency:
 
 Encoder
-    * ``raw_node_norm`` — BatchNorm1d on input node features (TF-IDF is
-      high-dimensional and sparse; BN stabilises training without affecting
-      semantics).
+    * ``raw_node_norm`` — BatchNorm1d on input node features.
     * ``node_proj`` + ``edge_proj`` — linear projections to ``hidden_dim``.
-    * ``encoder_conv`` — GINEConv with configurable aggregation and a node
-      transformation MLP (or linear) in the GIN neighbourhood function.
+    * ``encoder_conv`` — GINEConv with configurable aggregation.
 
 Decoder (multi-task)
-    1. Structure reconstruction — inner product ⟨Z_i, Z_j⟩, trained with
-       BCE against positive edges and negative samples.
+    1. Structure — directed concat-MLP (default) or inner product. Trained
+       with BCE on observed edges and *in-graph* non-edges (never cross-graph
+       pairs from a PyG mini-batch).
     2. Node feature reconstruction — 2-layer MLP from latent Z to input dim.
-    3. Edge attribute reconstruction — 2-layer MLP from ⟨Z_i ∥ Z_j⟩ to
-       edge-feature dim.
+    3. Edge attribute reconstruction — 2-layer MLP from ⟨Z_i ∥ Z_j⟩.
 
-Design notes
-------------
-``raw_edge_norm`` is intentionally absent (BGL FIX #2): BGL's
-``log1p(td_std)`` edge feature is ~0 for 99% of edges; in-model BatchNorm
-would amplify the rare non-zero values and cause gradient explosion.  Edge
-features are instead pre-normalised once before training using global
-mean/std computed over the training split, with std clamped ≥ 0.1.
-
-Ablation toggles (passed to __init__)
-    ``gine_aggregation``    — ``"sum"`` | ``"mean"`` | ``"max"``
-    ``node_transformation`` — ``"mlp"`` (2-layer BN+ReLU) | ``"linear"``
-
-Training helpers
-----------------
-    train_epoch(model, loader, optimizer, device, *, alpha, beta, gamma)
-    compute_anomaly_scores(model, loader, device, *, alpha, beta, gamma, return_components)
+``raw_edge_norm`` is intentionally absent: BGL's ``log1p(td_std)`` is ~0 for
+most edges and in-model BatchNorm would explode. Edges are pre-normalised
+on the training split with std clamped ≥ 0.1.
 """
 
 from __future__ import annotations
@@ -43,27 +28,17 @@ import torch.nn.functional as F
 from torch_geometric.nn import GINEConv
 from torch_geometric.utils import negative_sampling, scatter
 
+FULL_STRUCTURE_MAX_NODES = 256
+
 
 class AttributeAwareGAE(nn.Module):
     """Multi-task Graph Autoencoder with a GINEConv encoder.
 
     Parameters
     ----------
-    node_dim : int
-        Input node feature dimension.
-    edge_dim : int
-        Input (pre-normalised) edge feature dimension.
-    hidden_dim : int
-        Intermediate projection dimension.
-    latent_dim : int
-        Latent embedding dimension output by the encoder.
-    gine_aggregation : str
-        Neighbourhood aggregation for GINEConv: ``"sum"``, ``"mean"``, or
-        ``"max"``.
-    node_transformation : str
-        Node MLP inside GINEConv: ``"mlp"`` (two linear layers separated by
-        BatchNorm1d + ReLU) or ``"linear"`` (single linear layer, no
-        activation).
+    structure_decoder : str
+        ``"mlp"`` (directed concat-MLP, default) or ``"inner_product"``
+        (symmetric ⟨z_i, z_j⟩, Family B ablation).
     """
 
     def __init__(
@@ -74,14 +49,18 @@ class AttributeAwareGAE(nn.Module):
         latent_dim: int = 64,
         gine_aggregation: str = "sum",
         node_transformation: str = "mlp",
+        structure_decoder: str = "mlp",
     ) -> None:
         super().__init__()
+        if structure_decoder not in {"mlp", "inner_product"}:
+            raise ValueError(
+                f"structure_decoder must be 'mlp' or 'inner_product', got {structure_decoder!r}"
+            )
+        self.structure_decoder_kind = structure_decoder
+        self.latent_dim = latent_dim
 
-        # ── Input standardisation ─────────────────────────────────────────────
         self.raw_node_norm = nn.BatchNorm1d(node_dim, affine=False)
-        # raw_edge_norm intentionally absent — BGL FIX #2 (pre-normalised upstream)
 
-        # ── Encoder ───────────────────────────────────────────────────────────
         self.node_proj = nn.Linear(node_dim, hidden_dim)
         self.edge_proj = nn.Linear(edge_dim, hidden_dim)
 
@@ -92,29 +71,29 @@ class AttributeAwareGAE(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, latent_dim),
             )
-        else:  # "linear"
+        else:
             nn_module = nn.Linear(hidden_dim, latent_dim)
 
         self.encoder_conv = GINEConv(nn_module, edge_dim=hidden_dim, aggr=gine_aggregation)
 
-        # ── Decoders ──────────────────────────────────────────────────────────
-        # 1. Structure: inner-product (no extra parameters)
+        self.structure_decoder = None
+        if structure_decoder == "mlp":
+            self.structure_decoder = nn.Sequential(
+                nn.Linear(latent_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
 
-        # 2. Node feature reconstruction
         self.node_decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, node_dim),
         )
-
-        # 3. Edge attribute reconstruction
         self.edge_decoder = nn.Sequential(
             nn.Linear(latent_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, edge_dim),
         )
-
-    # ── Forward passes ────────────────────────────────────────────────────────
 
     def standardize_inputs(
         self,
@@ -138,16 +117,16 @@ class AttributeAwareGAE(nn.Module):
         return self.encoder_conv(x_h, edge_index, edge_h)
 
     def decode_structure(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """Inner-product decoder; returns raw BCE logits."""
+        """Directed (MLP) or symmetric (inner-product) logits for edge pairs."""
         src, dst = edge_index
-        return (z[src] * z[dst]).sum(dim=1)
+        if self.structure_decoder is None:
+            return (z[src] * z[dst]).sum(dim=1)
+        return self.structure_decoder(torch.cat([z[src], z[dst]], dim=-1)).squeeze(-1)
 
     def decode_node_features(self, z: torch.Tensor) -> torch.Tensor:
         return self.node_decoder(z)
 
-    def decode_edge_attributes(
-        self, z: torch.Tensor, edge_index: torch.Tensor
-    ) -> torch.Tensor:
+    def decode_edge_attributes(self, z: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         src, dst = edge_index
         return self.edge_decoder(torch.cat([z[src], z[dst]], dim=-1))
 
@@ -163,7 +142,137 @@ class AttributeAwareGAE(nn.Module):
         return z, x_norm, edge_attr_norm
 
 
-# ── Training helpers ──────────────────────────────────────────────────────────
+def per_graph_negative_sampling(edge_index: torch.Tensor, ptr: torch.Tensor) -> torch.Tensor:
+    """Sample one non-edge per observed edge, restricted to that graph's nodes.
+
+    Mini-batch ``negative_sampling(..., num_nodes=batch.num_nodes)`` treats the
+    disjoint union as one graph and yields trivial cross-graph negatives.
+    """
+    if edge_index.size(1) == 0 or ptr.numel() < 2:
+        return edge_index.new_zeros((2, 0))
+    src, dst = edge_index[0], edge_index[1]
+    chunks: list[torch.Tensor] = []
+    n_graphs = int(ptr.numel() - 1)
+    for graph in range(n_graphs):
+        lo = int(ptr[graph].item())
+        hi = int(ptr[graph + 1].item())
+        n_nodes = hi - lo
+        mask = (src >= lo) & (src < hi)
+        pos = edge_index[:, mask]
+        if pos.size(1) == 0 or n_nodes <= 0:
+            continue
+        local = pos - lo
+        neg_local = negative_sampling(
+            local,
+            num_nodes=n_nodes,
+            num_neg_samples=pos.size(1),
+        )
+        if neg_local.numel() == 0:
+            continue
+        chunks.append(neg_local + lo)
+    if not chunks:
+        return edge_index.new_zeros((2, 0))
+    return torch.cat(chunks, dim=1)
+
+
+def complete_directed_index(num_nodes: int, device: torch.device) -> torch.Tensor:
+    """All directed pairs including self-loops (collapsed graphs may loop)."""
+    src = torch.arange(num_nodes, device=device).repeat_interleave(num_nodes)
+    dst = torch.arange(num_nodes, device=device).repeat(num_nodes)
+    return torch.stack([src, dst], dim=0)
+
+
+def graph_ptr(batch, num_graphs: int, device: torch.device) -> torch.Tensor:
+    """Node-offset pointer tensor, reconstructed from ``batch.batch`` if needed."""
+    ptr = getattr(batch, "ptr", None)
+    if ptr is not None:
+        return ptr
+    counts = torch.bincount(batch.batch, minlength=num_graphs)
+    out = torch.zeros(num_graphs + 1, dtype=torch.long, device=device)
+    out[1:] = torch.cumsum(counts, dim=0)
+    return out
+
+
+def _structure_terms(
+    model: AttributeAwareGAE,
+    z: torch.Tensor,
+    pos_index: torch.Tensor,
+    neg_index: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (mean pos BCE, mean neg BCE) as logits; zeros when a set is empty."""
+    device = z.device
+    pos_loss = torch.tensor(0.0, device=device)
+    neg_loss = torch.tensor(0.0, device=device)
+    if pos_index.size(1) > 0:
+        pos_logits = model.decode_structure(z, pos_index)
+        pos_loss = F.binary_cross_entropy_with_logits(
+            pos_logits, torch.ones_like(pos_logits)
+        )
+    if neg_index is not None and neg_index.size(1) > 0:
+        neg_logits = model.decode_structure(z, neg_index)
+        neg_loss = F.binary_cross_entropy_with_logits(
+            neg_logits, torch.zeros_like(neg_logits)
+        )
+    return pos_loss, neg_loss
+
+
+def _structure_error_vector(
+    model: AttributeAwareGAE,
+    z: torch.Tensor,
+    edge_index: torch.Tensor,
+    ptr: torch.Tensor,
+    *,
+    include_non_edges: bool,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Per-graph structure error: pos BCE (+ in-graph non-edge BCE when requested)."""
+    device = z.device
+    num_graphs = int(ptr.numel() - 1)
+    scores = torch.zeros(num_graphs, device=device)
+    src = edge_index[0]
+    for graph in range(num_graphs):
+        lo = int(ptr[graph].item())
+        hi = int(ptr[graph + 1].item())
+        n_nodes = hi - lo
+        mask = (src >= lo) & (src < hi) if edge_index.size(1) else None
+        pos = edge_index[:, mask] if mask is not None else edge_index.new_zeros((2, 0))
+        neg = None
+        if include_non_edges and n_nodes > 0:
+            neg = _in_graph_non_edges(pos, lo, n_nodes, device, generator)
+        pos_loss, neg_loss = _structure_terms(model, z, pos, neg)
+        scores[graph] = pos_loss + (neg_loss if include_non_edges else torch.tensor(0.0, device=device))
+    return scores
+
+
+def _in_graph_non_edges(
+    pos: torch.Tensor,
+    lo: int,
+    n_nodes: int,
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    """Non-edges inside one graph: full digraph when small, else sampled."""
+    del generator  # sampling uses PyG's RNG; seed the process for campaigns
+    if n_nodes <= 0:
+        return pos.new_zeros((2, 0))
+    if n_nodes <= FULL_STRUCTURE_MAX_NODES:
+        complete = complete_directed_index(n_nodes, device)
+        adj = torch.zeros((n_nodes, n_nodes), dtype=torch.bool, device=device)
+        if pos.size(1):
+            adj[pos[0] - lo, pos[1] - lo] = True
+        keep = ~adj[complete[0], complete[1]]
+        return complete[:, keep] + lo
+    local = pos - lo if pos.size(1) else pos.new_zeros((2, 0))
+    n_pos = max(int(pos.size(1)), 1)
+    neg_local = negative_sampling(
+        local,
+        num_nodes=n_nodes,
+        num_neg_samples=n_pos,
+        force_undirected=False,
+    )
+    if neg_local.numel() == 0:
+        return pos.new_zeros((2, 0))
+    return neg_local + lo
 
 
 def train_epoch(
@@ -176,19 +285,7 @@ def train_epoch(
     beta: float = 1.0,
     gamma: float = 1.0,
 ) -> tuple[float, float, float, float]:
-    """Run one full training epoch.
-
-    Parameters
-    ----------
-    alpha, beta, gamma : float
-        Loss weights for structure, node-feature, and edge-attribute
-        reconstruction respectively.
-
-    Returns
-    -------
-    tuple[float, float, float, float]
-        Per-graph mean (total, structure, node, edge) losses.
-    """
+    """Run one full training epoch with per-graph structure negatives."""
     model.train()
     total_loss = total_str = total_node = total_edge = 0.0
 
@@ -197,27 +294,28 @@ def train_epoch(
         optimizer.zero_grad()
 
         z, x_norm, edge_attr_norm = model(batch.x, batch.edge_index, batch.edge_attr)
+        num_graphs = batch.num_graphs if hasattr(batch, "num_graphs") else 1
+        ptr = graph_ptr(batch, num_graphs, device)
 
-        # 1. Structure loss (guard against empty-edge batches)
         loss_str = torch.tensor(0.0, device=device)
         if batch.edge_index.size(1) > 0:
             pos_logits = model.decode_structure(z, batch.edge_index)
-            neg_edge = negative_sampling(
-                batch.edge_index,
-                num_nodes=batch.num_nodes,
-                num_neg_samples=batch.edge_index.size(1),
+            neg_edge = per_graph_negative_sampling(batch.edge_index, ptr)
+            pos_loss = F.binary_cross_entropy_with_logits(
+                pos_logits, torch.ones_like(pos_logits)
             )
-            neg_logits = model.decode_structure(z, neg_edge)
-            loss_str = (
-                F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits))
-                + F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits))
-            )
+            if neg_edge.size(1) > 0:
+                neg_logits = model.decode_structure(z, neg_edge)
+                neg_loss = F.binary_cross_entropy_with_logits(
+                    neg_logits, torch.zeros_like(neg_logits)
+                )
+            else:
+                neg_loss = torch.tensor(0.0, device=device)
+            loss_str = pos_loss + neg_loss
 
-        # 2. Node feature loss
         x_rec = model.decode_node_features(z)
         loss_node = F.mse_loss(x_rec, x_norm)
 
-        # 3. Edge attribute loss
         loss_edge = torch.tensor(0.0, device=device)
         if edge_attr_norm is not None and edge_attr_norm.size(0) > 0:
             edge_rec = model.decode_edge_attributes(z, batch.edge_index)
@@ -250,26 +348,14 @@ def compute_anomaly_scores(
     beta: float = 1.0,
     gamma: float = 1.0,
     return_components: bool = False,
+    include_structure_non_edges: bool = True,
 ) -> tuple:
     """Compute per-graph anomaly scores (weighted reconstruction error).
 
-    Parameters
-    ----------
-    alpha, beta, gamma : float
-        Same loss weights used during training.
-    return_components : bool
-        When True, also return unweighted structure/node/edge errors and
-        graph identifiers. Combined scores stay ``α·str + β·node + γ·edge``.
-
-    Returns
-    -------
-    scores : numpy.ndarray, shape (N,)
-    labels : numpy.ndarray, shape (N,)
-    When *return_components* is True, also:
-    components : dict[str, numpy.ndarray]
-    graph_ids : list[str]
+    Structure error matches training: BCE on observed edges plus in-graph
+    non-edges (full directed adjacency on small collapsed graphs). Combined
+    scores stay ``α·str + β·node + γ·edge``.
     """
-
     model.eval()
     all_scores, all_labels = [], []
     all_structure, all_node, all_edge = [], [], []
@@ -279,25 +365,22 @@ def compute_anomaly_scores(
         batch = batch.to(device)
         z, x_norm, edge_attr_norm = model(batch.x, batch.edge_index, batch.edge_attr)
         num_graphs = batch.num_graphs if hasattr(batch, "num_graphs") else 1
+        ptr = graph_ptr(batch, num_graphs, device)
 
-        # Structure error (per graph)
-        g_str = torch.zeros(num_graphs, device=device)
-        if batch.edge_index.size(1) > 0:
-            pos_probs = torch.sigmoid(model.decode_structure(z, batch.edge_index))
-            edge_err = F.binary_cross_entropy(
-                pos_probs, torch.ones_like(pos_probs), reduction="none"
-            )
-            edge_batch = batch.batch[batch.edge_index[0]]
-            g_str = scatter(edge_err, edge_batch, dim=0, reduce="mean", dim_size=num_graphs)
+        g_str = _structure_error_vector(
+            model,
+            z,
+            batch.edge_index,
+            ptr,
+            include_non_edges=include_structure_non_edges,
+        )
 
-        # Node error (per graph)
         x_rec = model.decode_node_features(z)
         node_errors = F.mse_loss(x_rec, x_norm, reduction="none").mean(dim=1)
         g_node = scatter(
             node_errors, batch.batch, dim=0, reduce="mean", dim_size=num_graphs
         )
 
-        # Edge error (per graph)
         g_edge = torch.zeros(num_graphs, device=device)
         if edge_attr_norm is not None and edge_attr_norm.size(0) > 0:
             ea_errors = F.mse_loss(

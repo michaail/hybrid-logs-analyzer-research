@@ -62,7 +62,7 @@ def test_family_yaml_files_are_split() -> None:
     assert {"baseline_full", "tfidf_only", "no_llm_enrichment", "no_enrichment"} <= names_a
     assert all(experiment_requires_graph_rebuild(item, representation) for item in enabled_experiments(representation))
     names_b = {item["name"] for item in enabled_experiments(train)}
-    assert {"alpha_0", "gine_mean_agg", "latent_32"} <= names_b
+    assert {"alpha_0", "gine_mean_agg", "latent_32", "inner_product_structure"} <= names_b
     assert not any(experiment_requires_graph_rebuild(item, train) for item in enabled_experiments(train))
     mixed_names = {item["name"] for item in enabled_experiments(mixed)}
     assert "tfidf_only" not in mixed_names
@@ -81,6 +81,9 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     assert base["parser"]["hdfs"]["raw_file"] == "hdfs/HDFS_full.log"
     assert base["parser"]["bgl"]["raw_file"] == "bgl/BGL_full.log"
     assert base["sequencing"]["bgl"]["step_minutes"] == base["sequencing"]["bgl"]["window_minutes"]
+    assert base["sequencing"]["bgl"]["split"] == "time"
+    assert base["ablation"]["representation"]["fit_on"] == "train_only"
+    assert base["ablation"]["graph"]["structure_decoder"] == "mlp"
     prepare_hdfs = (REPOSITORY_ROOT / "scripts" / "prepare_hdfs_campaign.py").read_text()
     assert "parser.hdfs.raw_file=hdfs/HDFS_full.log" in prepare_hdfs
     assert "ablation.enrichment_model_size=large" in prepare_hdfs
@@ -128,11 +131,22 @@ def test_feature_contract_defaults_to_notebook_raw() -> None:
     assert feature_contract_from_config(config) == "notebook_raw_v1"
     identity = graph_identity_from_config(config)
     assert identity["unique_sequences"] is True
-    assert identities_match(identity, {**LEGACY_GRAPH_IDENTITY, "unique_sequences": True})
+    assert identity["fit_on"] == "train_only"
+    assert identity["split_protocol"] == "stratified"
+    assert identities_match(
+        identity,
+        {
+            **LEGACY_GRAPH_IDENTITY,
+            "unique_sequences": True,
+            "fit_on": "train_only",
+            "split_protocol": "stratified",
+        },
+    )
 
 
 def test_train_only_guard_allows_legacy_baseline_without_meta() -> None:
     config = _baseline_config(unique_sequences=False)
+    config["ablation"]["representation"] = {"fit_on": "all"}
     assert_train_only_compatible(config, bundle_meta=None)
 
 
@@ -305,6 +319,7 @@ def test_hdfs_unique_sequences_identity_and_legacy_default() -> None:
     config = _baseline_config()
     assert unique_sequences_from_config(config) is True
     assert graph_identity_from_config(config)["unique_sequences"] is True
+    assert graph_identity_from_config(config)["fit_on"] == "train_only"
     missing = graph_identity_from_meta(
         {
             "llm_enrichment_enabled": True,
@@ -323,6 +338,7 @@ def test_hdfs_unique_sequences_identity_and_legacy_default() -> None:
     bgl = yaml.safe_load((REPOSITORY_ROOT / "configs" / "ablation_base.yaml").read_text())
     assert unique_sequences_from_config(bgl) is False
     assert graph_identity_from_config(bgl)["unique_sequences"] is False
+    assert graph_identity_from_config(bgl)["split_protocol"] == "time"
     baseline = yaml.safe_load((REPOSITORY_ROOT / "configs" / "hdfs_baseline.yaml").read_text())
     assert unique_sequences_from_config(baseline) is False
 
@@ -350,6 +366,7 @@ def test_stage45_structure_config_ignores_embeddings_and_edge_flag() -> None:
     assert "embeddings" not in hybrid
     assert "use_edge_features" not in hybrid
     assert "llm_enrichment_enabled" not in hybrid
+    assert hybrid["fit_on"] == "train_only"
     unique_off = run_ablation._stage45_structure_config(_baseline_config(unique_sequences=False))
     assert unique_off != hybrid
     stabilized = _baseline_config()

@@ -66,6 +66,13 @@ experiments:
       experiment.name: gamma_05
       training.gamma: 0.5
 
+  - name: inner_product_structure
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: inner_product_structure
+      ablation.graph.structure_decoder: inner_product
+
   - name: alpha_0
     enabled: true
     requires_graph_rebuild: false

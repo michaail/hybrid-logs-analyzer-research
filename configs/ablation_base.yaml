@@ -23,9 +23,10 @@ parser:
 sequencing:
   bgl:
     window_minutes: 20
-    # Keep windows disjoint: the graph split is stratified at window level, so
-    # overlapping windows would copy log records across train/val/test.
+    # Window inside each time split. Overlap is allowed within a split only.
     step_minutes: 20
+    # Cut the event stream before windowing (inductive_v1). stratified = notebook-era.
+    split: time
 
 ablation:
   llm_enrichment_enabled: true
@@ -33,6 +34,10 @@ ablation:
   # Thesis-comparable HDFS graphs use the original notebook feature encoding.
   # Set stabilized_v2 only as an explicit Family A arm.
   feature_contract: notebook_raw_v1
+  representation:
+    # train_only = inductive_v1 (Drain + TF-IDF fit on train units).
+    # all = transductive_v1 notebook ceiling; do not mix split locks.
+    fit_on: train_only
   embeddings:
     tfidf_enabled: true
     sbert_enabled: true
@@ -42,6 +47,8 @@ ablation:
     unique_sequences: true
     gine_aggregation: sum
     node_transformation: mlp
+    # Directed concat-MLP. Family B arm inner_product is the symmetric decoder.
+    structure_decoder: mlp
 
 training:
   train_mode: clean
