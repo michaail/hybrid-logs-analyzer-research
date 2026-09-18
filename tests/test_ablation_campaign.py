@@ -87,7 +87,7 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     prepare_hdfs = (REPOSITORY_ROOT / "scripts" / "prepare_hdfs_campaign.py").read_text()
     assert "parser.hdfs.raw_file=hdfs/HDFS_full.log" in prepare_hdfs
     assert "ablation.enrichment_model_size=large" in prepare_hdfs
-    assert "ablation.graph.unique_sequences=true" in prepare_hdfs
+    assert "ablation.graph.unique_sequences=true" not in prepare_hdfs
     prepare = (REPOSITORY_ROOT / "scripts" / "prepare_bgl_campaign.py").read_text()
     assert "experiment.dataset=bgl" in prepare
     assert "ablation_representation_bgl.yaml" in prepare
@@ -130,14 +130,14 @@ def test_feature_contract_defaults_to_notebook_raw() -> None:
     config = _baseline_config()
     assert feature_contract_from_config(config) == "notebook_raw_v1"
     identity = graph_identity_from_config(config)
-    assert identity["unique_sequences"] is True
+    assert identity["unique_sequences"] is False
     assert identity["fit_on"] == "train_only"
     assert identity["split_protocol"] == "stratified"
     assert identities_match(
         identity,
         {
             **LEGACY_GRAPH_IDENTITY,
-            "unique_sequences": True,
+            "unique_sequences": False,
             "fit_on": "train_only",
             "split_protocol": "stratified",
         },
@@ -317,8 +317,8 @@ def test_select_unique_sequences_keeps_both_labels_when_mixed() -> None:
 
 def test_hdfs_unique_sequences_identity_and_legacy_default() -> None:
     config = _baseline_config()
-    assert unique_sequences_from_config(config) is True
-    assert graph_identity_from_config(config)["unique_sequences"] is True
+    assert unique_sequences_from_config(config) is False
+    assert graph_identity_from_config(config)["unique_sequences"] is False
     assert graph_identity_from_config(config)["fit_on"] == "train_only"
     missing = graph_identity_from_meta(
         {
@@ -346,11 +346,11 @@ def test_hdfs_unique_sequences_identity_and_legacy_default() -> None:
 def test_stage45_config_includes_unique_sequences_flag() -> None:
     import run_ablation
 
-    enabled = run_ablation._stage45_config(_baseline_config())
-    disabled = run_ablation._stage45_config(_baseline_config(unique_sequences=False))
-    assert enabled["unique_sequences"] is True
-    assert disabled["unique_sequences"] is False
-    assert enabled != disabled
+    default = run_ablation._stage45_config(_baseline_config())
+    topology_only = run_ablation._stage45_config(_baseline_config(unique_sequences=True))
+    assert default["unique_sequences"] is False
+    assert topology_only["unique_sequences"] is True
+    assert default != topology_only
 
 
 def test_stage45_structure_config_ignores_embeddings_and_edge_flag() -> None:
@@ -367,8 +367,8 @@ def test_stage45_structure_config_ignores_embeddings_and_edge_flag() -> None:
     assert "use_edge_features" not in hybrid
     assert "llm_enrichment_enabled" not in hybrid
     assert hybrid["fit_on"] == "train_only"
-    unique_off = run_ablation._stage45_structure_config(_baseline_config(unique_sequences=False))
-    assert unique_off != hybrid
+    topology_only = run_ablation._stage45_structure_config(_baseline_config(unique_sequences=True))
+    assert topology_only != hybrid
     stabilized = _baseline_config()
     stabilized["ablation"]["feature_contract"] = "stabilized_v2"
     assert run_ablation._stage45_structure_config(stabilized) != hybrid

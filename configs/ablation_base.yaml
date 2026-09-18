@@ -43,8 +43,9 @@ ablation:
     sbert_enabled: true
   graph:
     use_edge_features: true
-    # HDFS only: one PyG graph per unique cluster_id sequence. Ignored for BGL.
-    unique_sequences: true
+    # HDFS blocks with identical template order may differ in parameters and timing.
+    # Keep every attributed block graph; topology-only deduplication is opt-in.
+    unique_sequences: false
     gine_aggregation: sum
     node_transformation: mlp
     # Directed concat-MLP. Family B arm inner_product is the symmetric decoder.
