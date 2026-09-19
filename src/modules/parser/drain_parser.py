@@ -250,14 +250,15 @@ class DrainParser:
     """Export learned templates to a file."""
     records = []
     for cluster in self.miner.drain.id_to_cluster.values():
-        tmpl = " ".join(cluster.log_template_tokens)
-        lines = self.cluster_id_to_lines.get(cluster.cluster_id, [])
-        records.append({
-            "cluster_id": cluster.cluster_id, # Stable ID for this template cluster
-            "template": tmpl,                 # The template string learned by Drain3
-            "count": cluster.size,            # authoritative count from Drain3
-            "examples": lines[:5]             # Include up to 5 example lines for context
-        })
+      tmpl = " ".join(cluster.log_template_tokens)
+      lines = self.cluster_id_to_lines.get(cluster.cluster_id, [])
+      examples = [self._template_example(line) for line in lines[:5]]
+      records.append({
+          "cluster_id": cluster.cluster_id, # Stable ID for this template cluster
+          "template": tmpl,                 # The template string learned by Drain3
+          "count": cluster.size,            # authoritative count from Drain3
+          "examples": [example for example in examples if example]
+      })
 
     output_path = Path(out_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +267,16 @@ class DrainParser:
       json.dump(records, f, indent=2)
 
     print(f"[INFO] Exported {len(records)} templates → {output_path}")
+
+
+  @staticmethod
+  def _template_example(line: str) -> str:
+    """Return an example safe to expose as parser/template context.
+
+    Dataset-specific parsers may remove benchmark-only target fields before
+    examples are written to the template artifact and later passed to an LLM.
+    """
+    return line
 
 
   def save(self, path: Optional[str] = None) -> None:

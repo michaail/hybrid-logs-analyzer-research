@@ -87,6 +87,17 @@ class BGLParser(DrainParser):
   # taken positionally from token index 3.
   _NODE_RE = re.compile(r"R\d+-M\d+-N[A-Z0-9]+(?:-[CI])?(?::J\d+-U\d+)?")
 
+  @staticmethod
+  def _template_example(line: str) -> str:
+    """Remove BGL's inline alert label from examples exported for enrichment.
+
+    The first token is the benchmark target (``-`` for normal, an alert code
+    otherwise). It must not enter the LLM context even though it is excluded
+    from the text fed to Drain.
+    """
+    parts = line.split(None, 1)
+    return parts[1] if len(parts) == 2 else ""
+
   def _extract_row(
     self,
     line: str,

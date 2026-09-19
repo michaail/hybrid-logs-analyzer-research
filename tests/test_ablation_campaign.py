@@ -130,6 +130,31 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     assert "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO" in llm_src
 
 
+def test_bgl_closing_matrices_have_five_paired_seeds_and_controls() -> None:
+    llm = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_bgl_llm_closed.yaml")
+    pb3 = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_bgl_pb3.yaml")
+    assert llm["seeds"] == pb3["seeds"] == [13, 29, 42, 71, 101]
+    assert {item["name"] for item in enabled_experiments(llm)} == {
+        "tfidf_only", "sbert_raw", "sbert_llm", "hybrid_raw", "hybrid_llm",
+    }
+    assert {item["name"] for item in enabled_experiments(pb3)} == {
+        "no_positional_features", "no_temporal_features",
+    }
+    assert len(experiment_seed_pairs(llm, 42)) == 25
+    assert len(experiment_seed_pairs(pb3, 42)) == 10
+
+
+def test_graph_identity_tracks_feature_group_ablations() -> None:
+    baseline = _baseline_config()
+    no_position = _baseline_config()
+    no_position["ablation"]["graph"]["node_positional_features"] = False
+    no_position["ablation"]["graph"]["edge_positional_features"] = False
+    assert not identities_match(
+        graph_identity_from_config(baseline),
+        graph_identity_from_config(no_position),
+    )
+
+
 def test_enrichment_rejects_small_and_both_models() -> None:
     from src.modules.enrichment import enrich_templates
 
@@ -334,6 +359,17 @@ def test_seeded_statistics_are_paired_against_baseline() -> None:
     arm_f1 = paired[(paired["name"] == "arm") & (paired["metric"] == "test_f1")].iloc[0]
     assert arm_f1["n_paired_seeds"] == 3
     assert arm_f1["mean_delta"] > 0
+
+
+def test_seeded_statistics_require_same_frozen_split_lock() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame([
+        {"name": "baseline_full", "seed": 1, "split_lock_id": "lock-a", "test_f1": 0.7, "test_pr_auc": 0.7, "test_roc_auc": 0.7},
+        {"name": "arm", "seed": 1, "split_lock_id": "lock-b", "test_f1": 0.9, "test_pr_auc": 0.9, "test_roc_auc": 0.9},
+    ])
+    _, paired = _seeded_campaign_statistics(frame, "baseline_full", bootstrap_samples=20)
+    assert paired[paired["name"] == "arm"].empty
 
 
 def test_fingerprint_ignores_git_revision() -> None:

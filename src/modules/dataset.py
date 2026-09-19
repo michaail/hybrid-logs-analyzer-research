@@ -402,9 +402,16 @@ def attach_cluster_embeddings(
     cluster_embeddings: dict[int, np.ndarray],
     *,
     use_edge_features: bool = True,
+    include_node_positional_features: bool = True,
+    include_edge_temporal_features: bool = True,
+    include_edge_positional_features: bool = True,
     missing_embedding: Literal["zero", "fail"] = "zero",
 ) -> list:
-    """Splice template embeddings onto cached structures to produce PyG graphs."""
+    """Splice embeddings and selected feature groups onto cached structures.
+
+    Position and time ablations remove columns from encoder input and decoder
+    targets. Full cached structures remain reusable across Family A arms.
+    """
     _require_torch_geometric()
     import torch
     from torch_geometric.data import Data
@@ -432,12 +439,24 @@ def attach_cluster_embeddings(
         mininterval=2.0,
     )
     for structure in iterator:
+        node_extra = np.asarray(structure["node_extra"], dtype=np.float32)
+        if not include_node_positional_features:
+            node_extra = node_extra[:, :4]
         node_feats = _node_features_from_structure(
-            structure, normalized, embed_dim, missing_embedding
+            structure,
+            normalized,
+            embed_dim,
+            missing_embedding,
+            node_extra=node_extra,
         )
         edge_attr_np = structure["edge_attr"]
         if use_edge_features:
-            edge_attr_np = np.asarray(edge_attr_np, dtype=np.float32)
+            columns = [0]
+            if include_edge_temporal_features:
+                columns.extend(range(1, 7))
+            if include_edge_positional_features:
+                columns.extend(range(7, 10))
+            edge_attr_np = np.asarray(edge_attr_np[:, columns], dtype=np.float32)
         elif edge_attr_np.shape[0] == 0:
             edge_attr_np = np.zeros((0, 1), dtype=np.float32)
         else:
@@ -936,10 +955,18 @@ def _node_features_from_structure(
     cluster_embeddings: dict[int, np.ndarray],
     embed_dim: int,
     missing_embedding: Literal["zero", "fail"],
+    *,
+    node_extra: np.ndarray | None = None,
 ) -> np.ndarray:
     cluster_ids = [int(cid) for cid in structure["cluster_ids"]]
     num_nodes = len(cluster_ids)
-    node_feats = np.zeros((num_nodes, embed_dim + NODE_EXTRA_DIM), dtype=np.float32)
+    extras = np.asarray(
+        structure["node_extra"] if node_extra is None else node_extra,
+        dtype=np.float32,
+    )
+    if extras.shape[0] != num_nodes:
+        raise ValueError("node_extra must contain one row per graph node.")
+    node_feats = np.zeros((num_nodes, embed_dim + extras.shape[1]), dtype=np.float32)
     for idx, cid in enumerate(cluster_ids):
         if cid not in cluster_embeddings:
             if missing_embedding == "fail":
@@ -948,7 +975,7 @@ def _node_features_from_structure(
         else:
             emb = np.asarray(cluster_embeddings[cid], dtype=np.float32)
         node_feats[idx, :embed_dim] = emb
-    node_feats[:, embed_dim:] = structure["node_extra"]
+    node_feats[:, embed_dim:] = extras
     return np.nan_to_num(node_feats, nan=0.0, posinf=0.0, neginf=0.0)
 
 

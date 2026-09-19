@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.modules.dataset import (
     NODE_EXTRA_DIM,
     SBERT_TEXT_EMBEDDING,
@@ -9,6 +11,13 @@ from src.modules.dataset import (
     node_recon_indices,
     sbert_dim_from_meta,
 )
+from src.modules.enrichment import (
+    IncompleteEnrichmentError,
+    enrichment_provenance,
+    require_complete_enrichment,
+    require_valid_enrichment_provenance,
+)
+from src.modules.parser.bgl_parser import BGLParser
 
 
 CID3_TEMPLATE = "RAS KERNEL <*> <*> <*>"
@@ -119,3 +128,47 @@ def test_sbert_dim_from_legacy_meta() -> None:
         == 384
     )
     assert sbert_dim_from_meta({"sbert_dim": 0, "embed_dim": 513}) == 0
+
+
+def test_complete_enrichment_rejects_missing_known_template() -> None:
+    templates = [
+        {"cluster_id": 7, "template": "known"},
+        {"cluster_id": -1, "template": "OOV"},
+    ]
+    with pytest.raises(IncompleteEnrichmentError, match="cluster_ids=\\[7\\]"):
+        require_complete_enrichment(templates)
+
+
+def test_complete_enrichment_allows_oov_and_validated_known_template() -> None:
+    require_complete_enrichment(
+        [
+            {"cluster_id": 7, "template": "known", "enriched_large": {}},
+            {"cluster_id": -1, "template": "OOV"},
+        ]
+    )
+
+
+def test_enrichment_provenance_rejects_changed_frozen_context() -> None:
+    templates = [
+        {
+            "cluster_id": 7,
+            "template": "known",
+            "examples": ["sanitized example"],
+            "enriched_large": {"embedding_text": "frozen response"},
+        },
+        {"cluster_id": -1, "template": "OOV"},
+    ]
+    provenance = enrichment_provenance(
+        templates, dataset="bgl", enabled=True, deployment="frozen-deployment"
+    )
+    require_valid_enrichment_provenance(templates, provenance, dataset="bgl")
+    templates[0]["examples"] = ["different sanitized example"]
+    with pytest.raises(IncompleteEnrichmentError, match="context_sha256"):
+        require_valid_enrichment_provenance(templates, provenance, dataset="bgl")
+
+
+def test_bgl_template_examples_exclude_inline_benchmark_label() -> None:
+    raw = "KERNDTLB 1117838570 2005.06.03 R02-M1-N0-C:J12-U11 payload"
+    example = BGLParser._template_example(raw)
+    assert example == "1117838570 2005.06.03 R02-M1-N0-C:J12-U11 payload"
+    assert "KERNDTLB" not in example

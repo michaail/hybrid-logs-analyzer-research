@@ -30,6 +30,9 @@ LEGACY_GRAPH_IDENTITY: dict[str, Any] = {
     "fit_on": "all",
     "split_protocol": "stratified",
     "sbert_text": "embedding_text",
+    "node_positional_features": True,
+    "edge_temporal_features": True,
+    "edge_positional_features": True,
 }
 
 GRAPH_IDENTITY_KEYS = tuple(LEGACY_GRAPH_IDENTITY.keys())
@@ -166,6 +169,9 @@ def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "fit_on": fit_on_from_config(config),
         "split_protocol": split_protocol_from_config(config),
         "sbert_text": sbert_text_from_config(config),
+        "node_positional_features": bool(graph.get("node_positional_features", True)),
+        "edge_temporal_features": bool(graph.get("edge_temporal_features", True)),
+        "edge_positional_features": bool(graph.get("edge_positional_features", True)),
     }
 
 
@@ -232,6 +238,9 @@ def _complete_graph_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
     identity["fit_on"] = str(raw.get("fit_on") or "all")
     identity["split_protocol"] = str(raw.get("split_protocol") or "stratified")
     identity["sbert_text"] = str(raw.get("sbert_text") or "embedding_text")
+    identity["node_positional_features"] = bool(raw.get("node_positional_features", True))
+    identity["edge_temporal_features"] = bool(raw.get("edge_temporal_features", True))
+    identity["edge_positional_features"] = bool(raw.get("edge_positional_features", True))
     return identity
 
 
@@ -868,6 +877,7 @@ def write_campaign_report(
                 "campaign_id": campaign_id,
                 "family": manifest.get("family"),
                 "seed": manifest.get("seed", metrics.get("seed")),
+                "split_lock_id": manifest.get("split_lock_id"),
                 "split_protocol": manifest.get("split_protocol"),
                 "oov_graph_rate": manifest.get("oov_graph_rate"),
                 "oov_line_rate": manifest.get("oov_line_rate"),
@@ -905,24 +915,9 @@ def write_campaign_report(
     summary_frame.to_csv(campaign_dir / "summary_by_arm.csv", index=False)
     paired_frame.to_csv(campaign_dir / "paired_bootstrap_ci.csv", index=False)
 
-    baseline_rows = frame[frame["name"] == baseline_name]
     delta_path = campaign_dir / "delta_vs_baseline.csv"
-    if not baseline_rows.empty:
-        baseline = baseline_rows.iloc[0]
-        delta_rows = []
-        for _, row in frame.iterrows():
-            delta_rows.append(
-                {
-                    "name": row["name"],
-                    "test_f1_delta": _delta(row.get("test_f1"), baseline.get("test_f1")),
-                    "test_pr_auc_delta": _delta(row.get("test_pr_auc"), baseline.get("test_pr_auc")),
-                    "test_roc_auc_delta": _delta(row.get("test_roc_auc"), baseline.get("test_roc_auc")),
-                    "test_f1_rel": _relative(row.get("test_f1"), baseline.get("test_f1")),
-                    "test_pr_auc_rel": _relative(row.get("test_pr_auc"), baseline.get("test_pr_auc")),
-                    "test_roc_auc_rel": _relative(row.get("test_roc_auc"), baseline.get("test_roc_auc")),
-                }
-            )
-        pd.DataFrame(delta_rows).to_csv(delta_path, index=False)
+    if not paired_frame.empty:
+        paired_frame.to_csv(delta_path, index=False)
 
     _write_campaign_figures(campaign_dir, records, baseline_name=baseline_name)
     readme = campaign_dir / "README.md"
@@ -952,9 +947,12 @@ def _seeded_campaign_statistics(
     baseline = frame[frame["name"] == baseline_name]
     if not baseline.empty and baseline["seed"].notna().all():
         rng = np.random.default_rng(bootstrap_seed)
+        pair_keys = ["seed"]
+        if "split_lock_id" in frame.columns and baseline["split_lock_id"].notna().all():
+            pair_keys.append("split_lock_id")
         for name, group in frame.groupby("name", sort=True):
-            merged = baseline[["seed", *metrics]].merge(
-                group[["seed", *metrics]], on="seed", suffixes=("_baseline", "_arm")
+            merged = baseline[[*pair_keys, *metrics]].merge(
+                group[[*pair_keys, *metrics]], on=pair_keys, suffixes=("_baseline", "_arm")
             )
             for metric in metrics:
                 delta = (
@@ -973,6 +971,7 @@ def _seeded_campaign_statistics(
                         "ci95_low": float(np.quantile(sampled, 0.025)),
                         "ci95_high": float(np.quantile(sampled, 0.975)),
                         "bootstrap_unit": "training_seed",
+                        "pairing_keys": "+".join(pair_keys),
                     }
                 )
     return pd.DataFrame(summary_rows), pd.DataFrame(paired_rows)

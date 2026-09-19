@@ -103,6 +103,7 @@ def build_sequences(
     split: str = "stratified",
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
+    embargo_minutes: int = 0,
 ) -> dict:
     """Route to the dataset-appropriate sequencer.
 
@@ -119,6 +120,9 @@ def build_sequences(
         (window the full stream).
     train_ratio, val_ratio : float
         Event-count fractions used when ``split="time"``.
+    embargo_minutes : int
+        BGL time only: discard events within this many minutes on either
+        side of each chronological partition boundary.
 
     Returns
     -------
@@ -137,6 +141,7 @@ def build_sequences(
                 step_minutes=step_minutes,
                 train_ratio=train_ratio,
                 val_ratio=val_ratio,
+                embargo_minutes=embargo_minutes,
             )
         return _build_bgl_sequences(df, window_minutes=window_minutes, step_minutes=step_minutes)
     raise ValueError(f"Unknown dataset {dataset!r}. Choose 'hdfs' or 'bgl'.")
@@ -271,15 +276,36 @@ def _build_bgl_sequences_time_split(
     step_minutes: int,
     train_ratio: float,
     val_ratio: float,
+    embargo_minutes: int = 0,
 ) -> dict:
-    """Cut the event stream by count, then window inside each split."""
+    """Cut the event stream by count, embargo boundaries, then window each split."""
     t0 = time.time()
     ordered = df.dropna(subset=["unix_ts"]).sort_values("unix_ts").reset_index(drop=True)
     n_train, n_val, n_test = event_count_slices(len(ordered), train_ratio, val_ratio)
+    embargo_seconds = int(embargo_minutes) * 60
+    if embargo_seconds < 0:
+        raise ValueError("embargo_minutes must be non-negative.")
+    train_cut = int(ordered["unix_ts"].iloc[n_train - 1])
+    val_cut = int(ordered["unix_ts"].iloc[n_train + n_val - 1])
+    train_span = ordered.iloc[:n_train]
+    val_span = ordered.iloc[n_train : n_train + n_val]
+    test_span = ordered.iloc[n_train + n_val :]
+    if embargo_seconds:
+        train_span = train_span.loc[train_span["unix_ts"] <= train_cut - embargo_seconds]
+        val_span = val_span.loc[
+            (val_span["unix_ts"] > train_cut + embargo_seconds)
+            & (val_span["unix_ts"] <= val_cut - embargo_seconds)
+        ]
+        test_span = test_span.loc[test_span["unix_ts"] > val_cut + embargo_seconds]
+    if train_span.empty or val_span.empty or test_span.empty:
+        raise ValueError(
+            "BGL time split has an empty partition after applying the "
+            f"{embargo_minutes}-minute embargo."
+        )
     slices = {
-        "train": (ordered.iloc[:n_train], 0),
-        "val": (ordered.iloc[n_train : n_train + n_val], BGL_SPLIT_STRIDE),
-        "test": (ordered.iloc[n_train + n_val :], 2 * BGL_SPLIT_STRIDE),
+        "train": (train_span, 0),
+        "val": (val_span, BGL_SPLIT_STRIDE),
+        "test": (test_span, 2 * BGL_SPLIT_STRIDE),
     }
     sequences: dict = {}
     counts: dict[str, int] = {}
@@ -291,13 +317,14 @@ def _build_bgl_sequences_time_split(
         sequences.update(part)
     logger.info(
         "BGL time-split sequencer: train=%d val=%d test=%d windows "
-        "(events %d/%d/%d, W=%d min, step=%d min) in %.2fs",
+        "(events %d/%d/%d before embargo, embargo=%d min, W=%d min, step=%d min) in %.2fs",
         counts.get("train", 0),
         counts.get("val", 0),
         counts.get("test", 0),
         n_train,
         n_val,
         n_test,
+        embargo_minutes,
         window_minutes,
         step_minutes,
         time.time() - t0,

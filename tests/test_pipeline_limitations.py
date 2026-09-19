@@ -26,7 +26,12 @@ from src.modules.sequencer import (
     event_count_slices,
     split_indices_from_bgl_windows,
 )
-from src.modules.unit_split import indices_from_unit_split, stratified_id_split
+from src.modules.unit_split import (
+    bgl_time_split_boundaries,
+    bgl_train_time_filter,
+    indices_from_unit_split,
+    stratified_id_split,
+)
 
 
 def _hdfs_frame(block_id: str, cluster_ids: list[int]) -> pd.DataFrame:
@@ -153,6 +158,53 @@ def test_bgl_time_split_windows_do_not_cross_the_cut() -> None:
             assert int(ts.max()) <= val_end
         else:
             assert int(ts.min()) > val_end
+
+
+def test_bgl_time_split_embargo_removes_boundary_events() -> None:
+    n = 80
+    frame = pd.DataFrame(
+        {
+            "unix_ts": np.arange(1_000, 1_000 + n * 60, 60, dtype=np.int64),
+            "cluster_id": [1] * n,
+            "parameters": [[] for _ in range(n)],
+            "is_anomaly": [False] * n,
+        }
+    )
+    sequences = build_sequences(
+        frame,
+        "bgl",
+        window_minutes=5,
+        step_minutes=5,
+        split="time",
+        train_ratio=0.5,
+        val_ratio=0.25,
+        embargo_minutes=2,
+    )
+    train_cut = int(frame["unix_ts"].iloc[39])
+    val_cut = int(frame["unix_ts"].iloc[59])
+    for window_id, group in sequences.items():
+        timestamps = group["unix_ts"].astype(int)
+        if bgl_split_name(int(window_id)) == "train":
+            assert int(timestamps.max()) <= train_cut - 120
+        elif bgl_split_name(int(window_id)) == "val":
+            assert int(timestamps.min()) > train_cut + 120
+            assert int(timestamps.max()) <= val_cut - 120
+        else:
+            assert int(timestamps.min()) > val_cut + 120
+
+
+def test_bgl_parser_fit_boundary_uses_time_not_file_order(tmp_path: Path) -> None:
+    rows = [
+        f"- {timestamp} 2005.06.03 node 2005-06-03-00.00.00.000000 node RAS KERNEL INFO message\n"
+        for timestamp in (50, 10, 20, 30, 40, 60, 70, 80, 90, 100)
+    ]
+    log_path = tmp_path / "bgl.log"
+    log_path.write_text("".join(rows))
+    train_cut, _ = bgl_time_split_boundaries(log_path, train_ratio=0.5, val_ratio=0.2)
+    include = bgl_train_time_filter(train_cut - 10)
+    kept = [int(row.split()[1]) for row in rows if include(row)]
+    assert train_cut == 50
+    assert kept == [10, 20, 30, 40]
 
 
 def test_bgl_window_ids_namespace_splits() -> None:

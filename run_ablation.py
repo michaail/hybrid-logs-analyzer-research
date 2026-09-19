@@ -79,8 +79,11 @@ from src.modules.dataset import (
 )
 from src.modules.enrichment import (
     ENRICHMENT_PROMPT_VERSION,
+    enrichment_provenance,
     enrich_templates,
     load_enriched_templates,
+    require_complete_enrichment,
+    require_valid_enrichment_provenance,
 )
 from src.modules.graph_builder import select_unique_sequences
 from src.modules.inference_release import (
@@ -96,8 +99,8 @@ from src.modules.sequencer import (
     split_indices_from_bgl_windows,
 )
 from src.modules.unit_split import (
-    bgl_first_n_line_filter,
-    bgl_train_line_count,
+    bgl_time_split_boundaries,
+    bgl_train_time_filter,
     hdfs_train_line_filter,
     hdfs_topology_fingerprints,
     indices_from_unit_split,
@@ -191,6 +194,12 @@ def stage2_enrich(
         "enrichment_model_size": "large" if ablation["llm_enrichment_enabled"] else ablation["enrichment_model_size"],
         "enrichment_backend": "deepseek-v4-pro" if ablation["llm_enrichment_enabled"] else None,
         "enrichment_prompt_version": ENRICHMENT_PROMPT_VERSION,
+        "enrichment_deployment": (
+            os.getenv("AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO")
+            if ablation["llm_enrichment_enabled"]
+            else None
+        ),
+        "enrichment_decoding": {"temperature": 0, "max_tokens": None, "max_retries": 2},
     }
 
     def build(temp_dir: Path) -> dict[str, Path]:
@@ -200,7 +209,15 @@ def stage2_enrich(
         if ablation["llm_enrichment_enabled"]:
             enrich_templates(templates, dataset, model_size="large")
         destination.write_text(json.dumps(templates, indent=2))
-        return {"templates": destination}
+        provenance = enrichment_provenance(
+            templates,
+            dataset=dataset,
+            enabled=bool(ablation["llm_enrichment_enabled"]),
+            deployment=stage_config["enrichment_deployment"],
+        )
+        provenance_path = temp_dir / "enrichment_provenance.json"
+        provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True))
+        return {"templates": destination, "enrichment_provenance": provenance_path}
 
     outputs, _, reused = store.stage(
         stage="stage2_enrich",
@@ -279,6 +296,13 @@ def stage45_build_dataset(
     if lock_path is not None:
         inputs.append(lock_path)
     ablation = config["ablation"]
+    provenance_path = templates_path.with_name("enrichment_provenance.json")
+    if bool(ablation["llm_enrichment_enabled"]):
+        if not provenance_path.exists():
+            raise FileNotFoundError(
+                "LLM graph construction requires frozen enrichment_provenance.json."
+            )
+        inputs.append(provenance_path)
     identity = graph_identity_from_config(config)
     stage_config = _stage45_config(config)
     if lock_path is not None:
@@ -291,6 +315,13 @@ def stage45_build_dataset(
             templates_path,
             preferred_size=preferred if preferred in {"large", "small"} else "large",
         )
+        if bool(ablation["llm_enrichment_enabled"]):
+            require_complete_enrichment(templates, field="enriched_large")
+            require_valid_enrichment_provenance(
+                templates,
+                json.loads(provenance_path.read_text()),
+                dataset=dataset,
+            )
         if not bool(ablation["llm_enrichment_enabled"]):
             cluster_to_enriched = {}
         structures, unique_stats = _ensure_graph_structures(
@@ -383,6 +414,15 @@ def stage45_build_dataset(
             structures,
             cluster_embeddings,
             use_edge_features=bool(ablation["graph"]["use_edge_features"]),
+            include_node_positional_features=bool(
+                ablation["graph"].get("node_positional_features", True)
+            ),
+            include_edge_temporal_features=bool(
+                ablation["graph"].get("edge_temporal_features", True)
+            ),
+            include_edge_positional_features=bool(
+                ablation["graph"].get("edge_positional_features", True)
+            ),
             missing_embedding="fail",
         )
         if not data_list:
@@ -412,6 +452,7 @@ def stage45_build_dataset(
             "sbert_dim": sbert_dim,
             "embedding_flags": ablation["embeddings"],
             "use_edge_features": bool(ablation["graph"]["use_edge_features"]),
+            "node_extra_dim": int(node_dim - embeddings.shape[1]),
             "llm_enrichment_enabled": identity["llm_enrichment_enabled"],
             "enrichment_model_size": identity["enrichment_model_size"],
             "feature_contract": identity["feature_contract"],
@@ -425,6 +466,8 @@ def stage45_build_dataset(
                 sum(OOV_CLUSTER_ID in set(map(int, item["cluster_ids"])) for item in structures)
             ),
         }
+        if bool(ablation["llm_enrichment_enabled"]):
+            meta["enrichment_provenance"] = file_digest(provenance_path)
         meta["oov_graph_rate"] = float(meta["n_graphs_with_oov"] / len(structures))
         if unit_split_path is not None:
             unit_meta = json.loads(Path(unit_split_path).read_text())
@@ -838,6 +881,8 @@ def _stage1_artifacts(
         "seed": int(config["experiment"]["seed"]),
         "split_protocol": split_protocol_from_config(config),
     }
+    if dataset == "bgl":
+        stage_config["sequencing"] = config.get("sequencing", {}).get("bgl", {})
     inputs = [raw_path, parser_config]
     if dataset == "hdfs" and fit_on == "train_only":
         inputs.append(labels_path)
@@ -889,9 +934,23 @@ def _stage1_artifacts(
                 }
                 include_line = hdfs_train_line_filter({str(item) for item in unit_payload["train"]})
             else:
-                n_train = bgl_train_line_count(raw_path)
-                unit_payload = {"kind": "bgl_event_index", "n_train": n_train}
-                include_line = bgl_first_n_line_filter(n_train)
+                sequencing = config.get("sequencing", {}).get("bgl", {})
+                train_cut, val_cut = bgl_time_split_boundaries(
+                    raw_path,
+                    train_ratio=float(sequencing.get("train_ratio", 0.70)),
+                    val_ratio=float(sequencing.get("val_ratio", 0.15)),
+                )
+                embargo_seconds = int(sequencing.get("embargo_minutes", 0)) * 60
+                train_fit_end = train_cut - embargo_seconds
+                unit_payload = {
+                    "kind": "bgl_time",
+                    "protocol": "time",
+                    "train_cut_timestamp": train_cut,
+                    "val_cut_timestamp": val_cut,
+                    "embargo_minutes": int(sequencing.get("embargo_minutes", 0)),
+                    "train_fit_end_timestamp": train_fit_end,
+                }
+                include_line = bgl_train_time_filter(train_fit_end)
         parser.fit_file(str(raw_path), include_line=include_line)
         frame = parser.annotate_file(str(raw_path), unmatched=unmatched)
         templates_path = temp_dir / "templates.json"
@@ -1153,7 +1212,11 @@ def _node_recon_index_for_bundle(
     for key, value in split_meta.items():
         meta.setdefault(key, value)
     sbert_dim = sbert_dim_from_meta(meta, node_dim=node_dim)
-    return node_recon_index_tensor(node_dim, sbert_dim=sbert_dim)
+    return node_recon_index_tensor(
+        node_dim,
+        sbert_dim=sbert_dim,
+        extra_dim=int(meta.get("node_extra_dim", 9)),
+    )
 
 
 def _normalise_edge_attributes(
@@ -1344,6 +1407,15 @@ def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
         "seed": config["experiment"]["seed"],
         "embeddings": ablation["embeddings"],
         "use_edge_features": ablation["graph"]["use_edge_features"],
+        "node_positional_features": bool(
+            ablation["graph"].get("node_positional_features", True)
+        ),
+        "edge_temporal_features": bool(
+            ablation["graph"].get("edge_temporal_features", True)
+        ),
+        "edge_positional_features": bool(
+            ablation["graph"].get("edge_positional_features", True)
+        ),
         "llm_enrichment_enabled": bool(ablation["llm_enrichment_enabled"]),
         "enrichment_model_size": ablation.get("enrichment_model_size"),
         "enrichment_backend": "deepseek-v4-pro" if ablation.get("llm_enrichment_enabled") else None,
@@ -2006,6 +2078,15 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
                 overrides.append(
                     f"ablation.graph.use_edge_features={json.dumps(identity['use_edge_features'])}"
                 )
+            for key in (
+                "node_positional_features",
+                "edge_temporal_features",
+                "edge_positional_features",
+            ):
+                if key in identity:
+                    overrides.append(
+                        f"ablation.graph.{key}={json.dumps(identity[key])}"
+                    )
             if "unique_sequences" in identity:
                 overrides.append(
                     f"ablation.graph.unique_sequences={json.dumps(identity['unique_sequences'])}"

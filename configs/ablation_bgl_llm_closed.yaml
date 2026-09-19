@@ -1,0 +1,63 @@
+# Pre-registered BGL representation campaign for the thesis LLM verdict.
+# Every arm rebuilds its graph bundle but shares one frozen time split lock.
+# Main contrast: hybrid_llm versus hybrid_raw (same TF-IDF, SBERT width,
+# graph structure and GAE; only the SBERT source text changes).
+family: representation
+requires_graph_rebuild: true
+seeds: [13, 29, 42, 71, 101]
+experiments:
+  - name: tfidf_only
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: tfidf_only
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: false
+      ablation.graph.use_edge_features: true
+
+  - name: sbert_raw
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_raw
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: sbert_llm
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_llm
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: hybrid_raw
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: hybrid_raw
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: hybrid_llm
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: hybrid_llm
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true

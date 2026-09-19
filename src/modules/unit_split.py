@@ -227,6 +227,47 @@ def bgl_first_n_line_filter(n_train: int) -> Callable[[str], bool]:
     return include
 
 
+def bgl_time_split_boundaries(
+    log_path: str | Path,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> tuple[int, int]:
+    """Return BGL event-time cut timestamps used by the sequencer.
+
+    Invalid or empty records are excluded just as they are in the BGL time
+    sequencer. Sorting timestamps rather than relying on file order keeps the
+    parser-fit boundary identical to the graph split boundary.
+    """
+    timestamps: list[int] = []
+    with Path(log_path).open("r", errors="replace") as handle:
+        for raw in handle:
+            parts = raw.split(None, 2)
+            if len(parts) < 2:
+                continue
+            try:
+                timestamps.append(int(parts[1]))
+            except ValueError:
+                continue
+    timestamps.sort()
+    n_train, n_val, n_test = event_count_slices(len(timestamps), train_ratio, val_ratio)
+    if not n_train or not n_val or not n_test:
+        raise ValueError("BGL requires non-empty train, validation, and test time partitions.")
+    return timestamps[n_train - 1], timestamps[n_train + n_val - 1]
+
+
+def bgl_train_time_filter(train_end_timestamp: int) -> Callable[[str], bool]:
+    """Keep BGL lines at or before the retained chronological train boundary."""
+
+    def include(line: str) -> bool:
+        parts = line.split(None, 2)
+        try:
+            return len(parts) >= 2 and int(parts[1]) <= train_end_timestamp
+        except ValueError:
+            return False
+
+    return include
+
+
 def bgl_train_line_count(log_path: str | Path, train_ratio: float = 0.70, val_ratio: float = 0.15) -> int:
     """Training event count for a BGL file (same cut as the time-split sequencer)."""
     n_train, _, _ = event_count_slices(count_nonempty_lines(log_path), train_ratio, val_ratio)

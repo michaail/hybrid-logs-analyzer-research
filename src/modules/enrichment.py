@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,113 @@ logger = logging.getLogger(__name__)
 # Bumped when the enricher system prompt changes. Stage-2 cache keys omit git SHA,
 # so this constant is what forces a re-enrich instead of reusing bland templates.
 ENRICHMENT_PROMPT_VERSION = "distinctive_v3"
+
+
+class IncompleteEnrichmentError(ValueError):
+    """Raised when a known template lacks a validated frozen LLM response."""
+
+
+def _canonical_digest(value: Any) -> str:
+    """Return a stable SHA-256 digest for JSON-serialisable provenance."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def enrichment_provenance(
+    templates_data: list[dict],
+    *,
+    dataset: str,
+    enabled: bool,
+    deployment: str | None = None,
+) -> dict[str, Any]:
+    """Describe frozen LLM inputs and outputs without storing credentials.
+
+    The context digest covers exactly the template records passed to the
+    enricher, including sanitized examples. The response digest covers the
+    validated `enriched_large` records. Both are checked before an LLM graph
+    can be built from a cached stage-2 result.
+    """
+    prompt_dir = Path(__file__).parent / "enricher" / "prompts"
+    prompt_sources = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(prompt_dir.glob("*.py"))
+    }
+    contexts = [
+        {
+            "cluster_id": int(entry.get("cluster_id", index)),
+            "template": entry.get("template", ""),
+            "examples": entry.get("examples", []),
+            "candidate_relations": entry.get("candidate_relations", []),
+            "retrieved_docs": entry.get("retrieved_docs", []),
+        }
+        for index, entry in enumerate(templates_data)
+        if int(entry.get("cluster_id", index)) >= 0
+    ]
+    responses = [
+        {
+            "cluster_id": int(entry.get("cluster_id", index)),
+            "enriched_large": entry.get("enriched_large"),
+        }
+        for index, entry in enumerate(templates_data)
+        if int(entry.get("cluster_id", index)) >= 0
+    ]
+    return {
+        "schema_version": 1,
+        "dataset": dataset.lower(),
+        "enabled": bool(enabled),
+        "prompt_version": ENRICHMENT_PROMPT_VERSION,
+        "prompt_sources_sha256": prompt_sources,
+        "prompt_sha256": _canonical_digest(prompt_sources),
+        "deployment": deployment if enabled else None,
+        "decoding": {"temperature": 0, "max_tokens": None, "max_retries": 2},
+        "n_known_templates": len(contexts),
+        "context_sha256": _canonical_digest(contexts),
+        "response_sha256": _canonical_digest(responses) if enabled else None,
+    }
+
+
+def require_valid_enrichment_provenance(
+    templates_data: list[dict],
+    provenance: dict[str, Any],
+    *,
+    dataset: str,
+) -> None:
+    """Fail closed if frozen enrichment provenance is absent or inconsistent."""
+    if not provenance.get("enabled"):
+        raise IncompleteEnrichmentError("LLM enrichment provenance is not marked enabled.")
+    if provenance.get("dataset") != dataset.lower():
+        raise IncompleteEnrichmentError("LLM enrichment provenance dataset does not match.")
+    if not provenance.get("deployment"):
+        raise IncompleteEnrichmentError("LLM enrichment provenance lacks a deployment identifier.")
+    require_complete_enrichment(templates_data)
+    expected = enrichment_provenance(
+        templates_data,
+        dataset=dataset,
+        enabled=True,
+        deployment=str(provenance["deployment"]),
+    )
+    for key in ("prompt_version", "prompt_sha256", "context_sha256", "response_sha256"):
+        if provenance.get(key) != expected[key]:
+            raise IncompleteEnrichmentError(f"LLM enrichment provenance mismatch for {key}.")
+
+
+def require_complete_enrichment(
+    templates_data: list[dict],
+    *,
+    field: str = "enriched_large",
+) -> None:
+    """Fail closed when a non-OOV template lacks usable enrichment data."""
+    missing = [
+        int(entry.get("cluster_id", index))
+        for index, entry in enumerate(templates_data)
+        if int(entry.get("cluster_id", 0)) >= 0
+        and not isinstance(entry.get(field), dict)
+    ]
+    if missing:
+        raise IncompleteEnrichmentError(
+            f"Missing validated {field} data for {len(missing)} known template(s): "
+            f"cluster_ids={missing[:20]}"
+        )
 
 
 def enrich_templates(
@@ -92,17 +200,7 @@ def enrich_templates(
                 "Failed to enrich template %d (%r): %s", i + 1, template[:60], exc
             )
 
-    missing = [
-        int(entry.get("cluster_id", i))
-        for i, entry in enumerate(templates_data)
-        if int(entry.get("cluster_id", 0)) >= 0 and field not in entry
-    ]
-    if missing:
-        logger.warning(
-            "Enrichment missing for %d template(s): cluster_ids=%s",
-            len(missing),
-            missing[:20],
-        )
+    require_complete_enrichment(templates_data, field=field)
 
     return templates_data
 

@@ -31,6 +31,8 @@ sequencing:
     step_minutes: 20
     # Cut the event stream before windowing (inductive_v1). stratified = notebook-era.
     split: time
+    # Exclude events near train/validation and validation/test boundaries.
+    embargo_minutes: 20
 
 ablation:
   llm_enrichment_enabled: true
@@ -63,6 +65,11 @@ ablation:
       extras: 1.0
   graph:
     use_edge_features: true
+    # Feature-group ablations remove these columns from graph input and node/
+    # edge reconstruction targets; topology and transition count remain intact.
+    node_positional_features: true
+    edge_temporal_features: true
+    edge_positional_features: true
     # HDFS blocks with identical template order may differ in parameters and timing.
     # Keep every attributed block graph; topology-only deduplication is opt-in.
     unique_sequences: false

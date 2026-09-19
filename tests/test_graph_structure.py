@@ -74,6 +74,30 @@ def test_no_edge_features_is_first_column_slice() -> None:
     np.testing.assert_allclose(sliced.reshape(-1), structure["edge_attr"][:, 0])
 
 
+def test_feature_group_ablation_removes_position_and_time_columns() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    from src.modules.dataset import attach_cluster_embeddings
+
+    structure = _seq_to_structure(
+        _hdfs_frame("blk_a", [1, 2, 1]),
+        0,
+        dataset="hdfs",
+        hdfs_feature_contract="notebook_raw_v1",
+    )
+    embeddings = {1: np.ones(4, dtype=np.float32), 2: np.full(4, 2.0, dtype=np.float32)}
+    graph = attach_cluster_embeddings(
+        [structure],
+        embeddings,
+        include_node_positional_features=False,
+        include_edge_temporal_features=False,
+        include_edge_positional_features=False,
+        missing_embedding="fail",
+    )[0]
+    assert graph.x.shape[1] == 4 + 4
+    assert graph.edge_attr.shape[1] == 1
+
+
 def test_feature_contract_changes_node_extras() -> None:
     seq = _hdfs_frame("blk_a", [1, 1, 1])
     raw = _seq_to_structure(seq, 0, dataset="hdfs", hdfs_feature_contract="notebook_raw_v1")
