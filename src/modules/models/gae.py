@@ -75,6 +75,12 @@ class AttributeAwareGAE(nn.Module):
         node_transformation: str = "mlp",
         structure_decoder: str = "mlp",
         node_recon_index: torch.Tensor | None = None,
+        tfidf_dim: int = 0,
+        sbert_dim: int = 0,
+        fusion_mode: str = "concat",
+        modality_projection_dim: int = 64,
+        node_loss_mode: str = "global",
+        node_block_weights: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         if structure_decoder not in {"mlp", "inner_product"}:
@@ -84,6 +90,23 @@ class AttributeAwareGAE(nn.Module):
         self.structure_decoder_kind = structure_decoder
         self.latent_dim = latent_dim
         self.node_dim = int(node_dim)
+        self.tfidf_dim = int(tfidf_dim)
+        self.sbert_dim = int(sbert_dim)
+        self.extra_dim = int(node_dim - self.tfidf_dim - self.sbert_dim)
+        if self.extra_dim < 0:
+            raise ValueError("tfidf_dim + sbert_dim cannot exceed node_dim.")
+        if fusion_mode not in {"concat", "projected_gated"}:
+            raise ValueError("fusion_mode must be 'concat' or 'projected_gated'.")
+        if node_loss_mode not in {"global", "block_balanced"}:
+            raise ValueError("node_loss_mode must be 'global' or 'block_balanced'.")
+        self.fusion_mode = fusion_mode
+        self.node_loss_mode = node_loss_mode
+        self.node_block_weights = {
+            "tfidf": 1.0,
+            "sbert": 1.0,
+            "extras": 1.0,
+            **(node_block_weights or {}),
+        }
         if node_recon_index is None:
             recon_index = torch.arange(node_dim, dtype=torch.long)
         else:
@@ -97,7 +120,23 @@ class AttributeAwareGAE(nn.Module):
 
         self.raw_node_norm = nn.BatchNorm1d(node_dim, affine=False)
 
-        self.node_proj = nn.Linear(node_dim, hidden_dim)
+        self.modality_projectors = nn.ModuleDict()
+        self.modality_gate_logits = None
+        node_projection_input = node_dim
+        if fusion_mode == "projected_gated":
+            blocks = self._input_block_ranges()
+            if len(blocks) < 2:
+                raise ValueError("projected_gated fusion requires at least two non-empty modalities.")
+            for name, (start, stop) in blocks.items():
+                self.modality_projectors[name] = nn.Sequential(
+                    nn.Linear(stop - start, modality_projection_dim),
+                    nn.LayerNorm(modality_projection_dim),
+                    nn.ReLU(),
+                )
+            self.modality_gate_logits = nn.Parameter(torch.zeros(len(blocks)))
+            node_projection_input = modality_projection_dim * len(blocks)
+
+        self.node_proj = nn.Linear(node_projection_input, hidden_dim)
         self.edge_proj = nn.Linear(edge_dim, hidden_dim)
 
         if node_transformation == "mlp":
@@ -139,6 +178,84 @@ class AttributeAwareGAE(nn.Module):
             self.node_recon_index = index
         return x_norm.index_select(1, index)
 
+    def _input_block_ranges(self) -> dict[str, tuple[int, int]]:
+        ranges: dict[str, tuple[int, int]] = {}
+        cursor = 0
+        if self.tfidf_dim:
+            ranges["tfidf"] = (cursor, cursor + self.tfidf_dim)
+            cursor += self.tfidf_dim
+        if self.sbert_dim:
+            ranges["sbert"] = (cursor, cursor + self.sbert_dim)
+            cursor += self.sbert_dim
+        if self.extra_dim:
+            ranges["extras"] = (cursor, cursor + self.extra_dim)
+        return ranges
+
+    def project_node_inputs(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Legacy concat or gated, equally sized modality projections."""
+        if self.fusion_mode == "concat":
+            return x_norm
+        assert self.modality_gate_logits is not None
+        gates = torch.softmax(self.modality_gate_logits, dim=0)
+        projected = []
+        for gate, (name, (start, stop)) in zip(
+            gates, self._input_block_ranges().items(), strict=True
+        ):
+            projected.append(gate * self.modality_projectors[name](x_norm[:, start:stop]))
+        return torch.cat(projected, dim=1)
+
+    def node_block_errors(
+        self, x_rec: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Per-node MSE for each reconstructed modality block."""
+        squared = F.mse_loss(x_rec, target, reduction="none")
+        original = self.node_recon_index.to(squared.device)
+        result: dict[str, torch.Tensor] = {}
+        for name, (start, stop) in self._input_block_ranges().items():
+            positions = torch.nonzero(
+                (original >= start) & (original < stop), as_tuple=False
+            ).reshape(-1)
+            if positions.numel():
+                result[name] = squared.index_select(1, positions).mean(dim=1)
+        return result
+
+    def node_reconstruction_loss(
+        self, x_rec: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        if self.node_loss_mode == "global":
+            return F.mse_loss(x_rec, target)
+        blocks = self.node_block_errors(x_rec, target)
+        weighted = [
+            float(self.node_block_weights[name]) * values.mean()
+            for name, values in blocks.items()
+            if float(self.node_block_weights[name]) > 0
+        ]
+        weight_sum = sum(
+            float(self.node_block_weights[name])
+            for name in blocks
+            if float(self.node_block_weights[name]) > 0
+        )
+        if not weighted or weight_sum <= 0:
+            raise ValueError("At least one reconstructed node block must have positive weight.")
+        return torch.stack(weighted).sum() / weight_sum
+
+    def node_anomaly_error(self, x_rec: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Per-node counterpart of the configured training objective."""
+        if self.node_loss_mode == "global":
+            return F.mse_loss(x_rec, target, reduction="none").mean(dim=1)
+        blocks = self.node_block_errors(x_rec, target)
+        weighted = [
+            float(self.node_block_weights[name]) * values
+            for name, values in blocks.items()
+            if float(self.node_block_weights[name]) > 0
+        ]
+        weight_sum = sum(
+            float(self.node_block_weights[name])
+            for name in blocks
+            if float(self.node_block_weights[name]) > 0
+        )
+        return torch.stack(weighted).sum(dim=0) / weight_sum
+
     def standardize_inputs(
         self,
         x: torch.Tensor,
@@ -156,7 +273,7 @@ class AttributeAwareGAE(nn.Module):
         edge_index: torch.Tensor,
         edge_attr_norm: torch.Tensor | None,
     ) -> torch.Tensor:
-        x_h = self.node_proj(x_norm)
+        x_h = self.node_proj(self.project_node_inputs(x_norm))
         edge_h = self.edge_proj(edge_attr_norm) if edge_attr_norm is not None else None
         return self.encoder_conv(x_h, edge_index, edge_h)
 
@@ -358,7 +475,9 @@ def train_epoch(
             loss_str = pos_loss + neg_loss
 
         x_rec = model.decode_node_features(z)
-        loss_node = F.mse_loss(x_rec, model.node_reconstruction_target(x_norm))
+        loss_node = model.node_reconstruction_loss(
+            x_rec, model.node_reconstruction_target(x_norm)
+        )
 
         loss_edge = torch.tensor(0.0, device=device)
         if edge_attr_norm is not None and edge_attr_norm.size(0) > 0:
@@ -403,6 +522,7 @@ def compute_anomaly_scores(
     model.eval()
     all_scores, all_labels = [], []
     all_structure, all_node, all_edge = [], [], []
+    all_tfidf, all_sbert, all_extras = [], [], []
     graph_ids: list[str] = []
 
     for batch in loader:
@@ -420,9 +540,8 @@ def compute_anomaly_scores(
         )
 
         x_rec = model.decode_node_features(z)
-        node_errors = F.mse_loss(
-            x_rec, model.node_reconstruction_target(x_norm), reduction="none"
-        ).mean(dim=1)
+        target = model.node_reconstruction_target(x_norm)
+        node_errors = model.node_anomaly_error(x_rec, target)
         g_node = scatter(
             node_errors, batch.batch, dim=0, reduce="mean", dim_size=num_graphs
         )
@@ -449,6 +568,21 @@ def compute_anomaly_scores(
             all_structure.append(g_str.cpu())
             all_node.append(g_node.cpu())
             all_edge.append(g_edge.cpu())
+            block_errors = model.node_block_errors(x_rec, target)
+            for name, destination in (
+                ("tfidf", all_tfidf),
+                ("sbert", all_sbert),
+                ("extras", all_extras),
+            ):
+                values = block_errors.get(name)
+                if values is None:
+                    destination.append(torch.zeros(num_graphs))
+                else:
+                    destination.append(
+                        scatter(
+                            values, batch.batch, dim=0, reduce="mean", dim_size=num_graphs
+                        ).cpu()
+                    )
             graph_ids.extend(_batch_graph_ids(batch, num_graphs))
 
     scores = torch.cat(all_scores).numpy()
@@ -460,6 +594,9 @@ def compute_anomaly_scores(
         "structure": torch.cat(all_structure).numpy() if all_structure else zeros,
         "node": torch.cat(all_node).numpy() if all_node else zeros,
         "edge": torch.cat(all_edge).numpy() if all_edge else zeros,
+        "tfidf": torch.cat(all_tfidf).numpy() if all_tfidf else zeros,
+        "sbert": torch.cat(all_sbert).numpy() if all_sbert else zeros,
+        "extras": torch.cat(all_extras).numpy() if all_extras else zeros,
     }
     return scores, labels, components, graph_ids
 

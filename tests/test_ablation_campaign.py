@@ -15,6 +15,7 @@ from src.modules.ablation import (
     component_metrics,
     enabled_experiments,
     experiment_requires_graph_rebuild,
+    experiment_seed_pairs,
     feature_contract_from_config,
     graph_identity_from_config,
     graph_identity_from_meta,
@@ -27,9 +28,11 @@ from src.modules.ablation import (
     unique_sequences_from_config,
     write_campaign_report,
     write_eval_pack,
+    _seeded_campaign_statistics,
 )
 from src.modules.artifacts import fingerprint
 from src.modules.graph_builder import select_unique_sequences
+from src.modules.unit_split import topology_grouped_id_split
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
@@ -67,6 +70,26 @@ def test_family_yaml_files_are_split() -> None:
     mixed_names = {item["name"] for item in enabled_experiments(mixed)}
     assert "tfidf_only" not in mixed_names
     assert mixed["requires_graph_rebuild"] is False
+
+
+def test_focused_hdfs_matrices_cover_proposed_experiment() -> None:
+    representation = load_matrix(
+        REPOSITORY_ROOT / "configs" / "ablation_hdfs_representation.yaml"
+    )
+    train = load_matrix(
+        REPOSITORY_ROOT / "configs" / "ablation_hdfs_fusion_train.yaml"
+    )
+    assert len(representation["seeds"]) >= 5
+    assert representation["seeds"] == train["seeds"]
+    assert {item["name"] for item in enabled_experiments(representation)} == {
+        "baseline_full", "tfidf_only", "sbert_only", "no_edge_features"
+    }
+    assert {item["name"] for item in enabled_experiments(train)} == {
+        "hybrid_projected_gated", "hybrid_lexical_recon",
+        "hybrid_block_balanced", "alpha_0",
+    }
+    pairs = experiment_seed_pairs(representation, 42)
+    assert len(pairs) == 4 * len(representation["seeds"])
 
 
 def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
@@ -186,10 +209,12 @@ def test_split_lock_roundtrip(tmp_path: Path) -> None:
         idx_test,
         sequence_ids=["a", "b", "c", "d", "e"],
         seed=42,
+        protocol="stratified",
     )
     loaded = load_split_lock(path)
     assert loaded["split_lock_id"] == lock_id
     assert loaded["n_total"] == 5
+    assert loaded["protocol"] == "stratified"
     class _Graph:
         def __init__(self, name: str) -> None:
             self.block_id = name
@@ -211,6 +236,21 @@ def test_split_lock_rejects_length_mismatch() -> None:
     }
     with pytest.raises(ValueError, match="n_total"):
         apply_split_lock([object(), object()], lock)
+
+
+def test_topology_grouped_split_has_no_group_overlap() -> None:
+    ids = [f"b{index}" for index in range(120)]
+    labels = {item: int(index % 11 == 0) for index, item in enumerate(ids)}
+    fingerprints = {item: f"g{index // 3}" for index, item in enumerate(ids)}
+    split = topology_grouped_id_split(ids, labels, fingerprints, seed=42)
+    assert set().union(*map(set, split.values())) == set(ids)
+    groups = {
+        name: {fingerprints[item] for item in values}
+        for name, values in split.items()
+    }
+    assert not (groups["train"] & groups["val"])
+    assert not (groups["train"] & groups["test"])
+    assert not (groups["val"] & groups["test"])
 
 
 def test_gzip_roundtrip(tmp_path: Path) -> None:
@@ -275,6 +315,25 @@ def test_eval_pack_and_campaign_report(tmp_path: Path) -> None:
     assert leaderboard[0]["name"] == "baseline_full"
     assert (tmp_path / "outputs" / "hdfs" / "campaigns" / "camp" / "README.md").exists()
     assert (tmp_path / "outputs" / "hdfs" / "campaigns" / "camp" / "ablation_comparison.png").exists()
+
+
+def test_seeded_statistics_are_paired_against_baseline() -> None:
+    import pandas as pd
+
+    rows = []
+    for seed, baseline, arm in ((1, 0.7, 0.8), (2, 0.8, 0.85), (3, 0.9, 0.95)):
+        for name, value in (("baseline_full", baseline), ("arm", arm)):
+            rows.append({
+                "name": name, "seed": seed,
+                "test_f1": value, "test_pr_auc": value, "test_roc_auc": value,
+            })
+    summary, paired = _seeded_campaign_statistics(
+        pd.DataFrame(rows), "baseline_full", bootstrap_samples=200, bootstrap_seed=1
+    )
+    assert set(summary["name"]) == {"baseline_full", "arm"}
+    arm_f1 = paired[(paired["name"] == "arm") & (paired["metric"] == "test_f1")].iloc[0]
+    assert arm_f1["n_paired_seeds"] == 3
+    assert arm_f1["mean_delta"] > 0
 
 
 def test_fingerprint_ignores_git_revision() -> None:

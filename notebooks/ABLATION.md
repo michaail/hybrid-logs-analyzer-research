@@ -22,7 +22,9 @@ Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT,
 - One Drain parse, one HDFS block sequencing, **one split lock** (`split_lock.npz`) shared by every Family A graph.
 - Family A does **not** rebuild collapsed topology seven times. Stage `stage45_graph_structure` caches per-block extras and 10-d edges keyed by dataset + `unique_sequences` + `feature_contract` + `fit_on` + `split_protocol`. Embedding arms (`tfidf_only`, `sbert_only`, `no_llm_enrichment`, …) splice a new node matrix; `no_edge_features` keeps the first edge column. Only `feature_contract_stabilized_v2` needs a second structure pass.
 - HDFS Family A graphs use **one PyG graph per block** (`ablation.graph.unique_sequences: false`): blocks with the same ordered `cluster_id` list can still differ in parameter statistics, edge timing, and labels, so they remain distinct training and evaluation examples. A topology-only representative dataset (`unique_sequences: true`) is an optional efficiency experiment, not the default benchmark; it changes the class distribution and must use its own `split_lock.npz`.
-- Seed 42, clean-train, val-F1 threshold, report test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
+- Default legacy matrices use seed 42; the focused HDFS experiment uses paired
+  seeds `[13, 29, 42, 71, 101]`. Use clean-train, a val-F1 threshold, and report
+  test **F1 / PR-AUC / ROC-AUC** (rank by PR-AUC).
 - LLM template enrichment is **Deepseek v4 Pro only** (`AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO`). Prompt version `distinctive_v3` is part of the stage-2 cache key; changing it re-enriches. MiniLM (`sbert_text: grounded_v1`) encodes enrichment fields only — not Drain templates or raw examples.
 - Default `ablation.feature_contract: notebook_raw_v1` (thesis-comparable). `stabilized_v2` is an explicit Family A arm.
 - Default campaign protocol is **`inductive_v1`**: `ablation.representation.fit_on: train_only`, HDFS per-block graphs, BGL `sequencing.bgl.split: time`, directed `structure_decoder: mlp`, fail-closed HDFS labels, `missing_embedding=fail`. Notebook / `hdfs_baseline.yaml` numbers are **`transductive_v1`** (Drain+TF-IDF fit on the full log, random window split, inner-product structure). Do **not** mix `split_lock.npz` / `graph_dataset.pt.gz` across protocols or compare PR-AUC between them.
@@ -33,6 +35,66 @@ Train-only **fails** if the config’s graph identity (LLM on/off, TF-IDF/SBERT,
 - Pin `GIT_REF` for the Colab clone; do not `git pull` mid-campaign. Cache fingerprints no longer include git SHA (SHA still lands on run manifests).
 
 ## Local prepare (Family A graphs)
+
+### HDFS hybrid-representation experiment (five paired seeds)
+
+The focused experiment uses:
+
+- `configs/ablation_hdfs_representation.yaml` for graph-changing arms:
+  `baseline_full`, `tfidf_only`, `sbert_only`, `no_edge_features`;
+- `configs/ablation_hdfs_fusion_train.yaml` on the **same campaign's**
+  `baseline_full` graph for `hybrid_projected_gated`,
+  `hybrid_lexical_recon`, `hybrid_block_balanced`, and `alpha_0`;
+- paired seeds `[13, 29, 42, 71, 101]` declared by both matrices.
+
+Prepare two separate all-block campaigns. Each campaign has one split lock shared
+by all representation bundles; graph tensors are not deduplicated.
+
+```bash
+# IID all-block protocol
+python scripts/prepare_hdfs_campaign.py \
+  --campaign-id hdfs_hybrid_stratified_v2 \
+  --workspace-root /path/to/workspace \
+  --matrix configs/ablation_hdfs_representation.yaml \
+  --set sequencing.hdfs.split=stratified
+
+# Generalisation to unseen ordered-template topologies
+python scripts/prepare_hdfs_campaign.py \
+  --campaign-id hdfs_hybrid_topology_grouped_v2 \
+  --workspace-root /path/to/workspace \
+  --matrix configs/ablation_hdfs_representation.yaml \
+  --set sequencing.hdfs.split=topology_grouped
+```
+
+For `topology_grouped`, a provisional Drain pass defines only the grouping;
+the final Drain parser is recreated and fitted exclusively on grouped-train
+blocks. Every provisional topology fingerprint is assigned to exactly one
+partition. The final graph set still contains every block.
+
+On Colab, run Family A and then Family B for each campaign. Family B must be
+given the matching campaign directory so the runner selects that campaign's
+`baseline_full`; do not pass an older standalone graph.
+
+```bash
+python run_ablation.py --mode train-only --family A \
+  --campaign-dir /content/workspace/campaigns/hdfs_hybrid_stratified_v2 \
+  --campaign-id hdfs_hybrid_stratified_v2 \
+  --matrix configs/ablation_hdfs_representation.yaml \
+  --workspace-root /content/workspace
+
+python run_ablation.py --mode train-only --family B \
+  --campaign-dir /content/workspace/campaigns/hdfs_hybrid_stratified_v2 \
+  --campaign-id hdfs_hybrid_stratified_v2 \
+  --matrix configs/ablation_hdfs_fusion_train.yaml \
+  --workspace-root /content/workspace
+```
+
+Repeat both training commands for the topology-grouped campaign. The report
+writes raw per-seed rows to `leaderboard.csv`, arm means/standard deviations to
+`summary_by_arm.csv`, and paired seed-bootstrap 95% intervals for deltas versus
+`baseline_full` to `paired_bootstrap_ci.csv`. Per-run score files contain
+`tfidf`, `sbert`, `extras`, `edge`, and `structure` errors. Dataset metadata and
+run manifests include OOV line/graph rates.
 
 From this repository root, Intel Mac PyTorch/PyG plus `requirements.txt`, Azure env for enrichment:
 
@@ -87,7 +149,7 @@ Suggested order: smoke → Family B → Family A → freeze leaderboard.
 
 ## Per-run artifact pack
 
-`outputs/{dataset}/{campaign_id}_{arm}/`
+`outputs/{dataset}/{campaign_id}_{arm}_seed{seed}/`
 
 - `metrics.json`, `component_metrics.json`, `history.json`, `config.yaml`, `manifest.json`
 - `attribute_gae.pt`

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -78,6 +79,100 @@ def stratified_id_split(
         "val": [array_ids[int(i)] for i in idx_val],
         "test": [array_ids[int(i)] for i in idx_test],
     }
+
+
+def topology_grouped_id_split(
+    ids: list,
+    labels: dict[Any, int],
+    fingerprints: dict[Any, str],
+    *,
+    seed: int,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> dict[str, list]:
+    """Split IDs while keeping every topology fingerprint in one partition.
+
+    Repeated ``GroupShuffleSplit`` candidates keep the rare anomaly class
+    reasonably balanced without leaking an ordered-template fingerprint.
+    The returned units remain full HDFS blocks; no topology is deduplicated.
+    """
+    from sklearn.model_selection import GroupShuffleSplit
+
+    missing_labels = [item for item in ids if item not in labels]
+    missing_groups = [item for item in ids if item not in fingerprints]
+    if missing_labels or missing_groups:
+        raise KeyError(
+            f"Topology split requires labels and fingerprints for every unit "
+            f"(missing labels={len(missing_labels)}, groups={len(missing_groups)})."
+        )
+    y = np.asarray([int(labels[item]) for item in ids], dtype=np.int64)
+    groups = np.asarray([str(fingerprints[item]) for item in ids], dtype=object)
+    indices = np.arange(len(ids), dtype=np.int64)
+    array_ids = np.asarray(ids, dtype=object)
+
+    def best_group_split(
+        candidate_indices: np.ndarray,
+        candidate_y: np.ndarray,
+        candidate_groups: np.ndarray,
+        test_size: float,
+        random_state: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        target_rate = float(candidate_y.mean())
+        splitter = GroupShuffleSplit(
+            n_splits=64, test_size=test_size, random_state=random_state
+        )
+        candidates = list(
+            splitter.split(candidate_indices, candidate_y, candidate_groups)
+        )
+        return min(
+            candidates,
+            key=lambda pair: (
+                abs(len(pair[1]) / len(candidate_indices) - test_size)
+                + abs(float(candidate_y[pair[1]].mean()) - target_rate)
+            ),
+        )
+
+    idx_train_base, idx_holdout = best_group_split(
+        indices, y, groups, 1.0 - train_ratio, seed
+    )
+    holdout_groups = groups[idx_holdout]
+    holdout_y = y[idx_holdout]
+    test_ratio = 1.0 - train_ratio - val_ratio
+    inner_train, inner_test = best_group_split(
+        idx_holdout,
+        holdout_y,
+        holdout_groups,
+        test_ratio / (val_ratio + test_ratio),
+        seed + 1,
+    )
+    idx_val = idx_holdout[inner_train]
+    idx_test = idx_holdout[inner_test]
+
+    # Keep the requested naming and guarantee exhaustive, disjoint membership.
+    result = {
+        "train": [array_ids[int(i)] for i in idx_train_base],
+        "val": [array_ids[int(i)] for i in idx_val],
+        "test": [array_ids[int(i)] for i in idx_test],
+    }
+    split_groups = [
+        {str(fingerprints[item]) for item in result[name]}
+        for name in ("train", "val", "test")
+    ]
+    if split_groups[0] & split_groups[1] or split_groups[0] & split_groups[2] or split_groups[1] & split_groups[2]:
+        raise RuntimeError("Topology-grouped split leaked a fingerprint across partitions.")
+    return result
+
+
+def hdfs_topology_fingerprints(frame: Any) -> dict[str, str]:
+    """Hash each block's ordered provisional Drain cluster sequence."""
+    required = {"block_id", "cluster_id"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"Annotated HDFS frame must contain {sorted(required)}.")
+    fingerprints: dict[str, str] = {}
+    for block_id, group in frame.groupby("block_id", sort=False):
+        payload = "|".join(str(int(value)) for value in group["cluster_id"].tolist())
+        fingerprints[str(block_id)] = hashlib.sha256(payload.encode()).hexdigest()
+    return fingerprints
 
 
 def indices_from_unit_split(

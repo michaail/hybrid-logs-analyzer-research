@@ -1,0 +1,53 @@
+# Focused HDFS representation experiment. Every arm is rebuilt from the same
+# all-block graph structures and the same split_lock; each is trained for all
+# declared seeds. Use a distinct campaign id for IID and topology_grouped.
+family: representation
+requires_graph_rebuild: true
+seeds: [13, 29, 42, 71, 101]
+experiments:
+  - name: baseline_full
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: baseline_full
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.graph.use_edge_features: true
+      ablation.feature_contract: notebook_raw_v1
+
+  - name: tfidf_only
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: tfidf_only
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: false
+      ablation.graph.use_edge_features: true
+      ablation.feature_contract: notebook_raw_v1
+
+  - name: sbert_only
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_only
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.graph.use_edge_features: true
+      ablation.feature_contract: notebook_raw_v1
+
+  - name: no_edge_features
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: no_edge_features
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.graph.use_edge_features: false
+      ablation.feature_contract: notebook_raw_v1

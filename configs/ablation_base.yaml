@@ -21,6 +21,10 @@ parser:
     config: configs/drain_bgl.ini
 
 sequencing:
+  hdfs:
+    # stratified = all-block IID; topology_grouped keeps every provisional
+    # ordered-template fingerprint in exactly one partition.
+    split: stratified
   bgl:
     window_minutes: 20
     # Window inside each time split. Overlap is allowed within a split only.
@@ -47,6 +51,16 @@ ablation:
   fusion:
     # all = reconstruct every node column. without_sbert = TF-IDF + extras only.
     node_reconstruct: all
+    # concat preserves the legacy model. projected_gated gives each modality an
+    # equal-width Linear+LayerNorm branch and learns softmax fusion gates.
+    mode: concat
+    modality_projection_dim: 64
+    # global = MSE over columns. block_balanced first averages within modality.
+    node_loss: global
+    node_block_weights:
+      tfidf: 1.0
+      sbert: 1.0
+      extras: 1.0
   graph:
     use_edge_features: true
     # HDFS blocks with identical template order may differ in parameters and timing.

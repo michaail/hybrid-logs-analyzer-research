@@ -37,10 +37,12 @@ from src.modules.ablation import (
     apply_split_lock,
     assert_train_only_compatible,
     enabled_experiments,
+    experiment_seed_pairs,
     experiment_requires_graph_rebuild,
     feature_contract_from_config,
     file_digest,
     fit_on_from_config,
+    fusion_mode_from_config,
     graph_identity_from_config,
     gunzip_file,
     gzip_file,
@@ -48,6 +50,7 @@ from src.modules.ablation import (
     load_matrix,
     load_split_lock,
     node_reconstruct_from_config,
+    node_loss_from_config,
     save_split_lock,
     sbert_text_from_config,
     sequence_ids_from_graphs,
@@ -96,10 +99,12 @@ from src.modules.unit_split import (
     bgl_first_n_line_filter,
     bgl_train_line_count,
     hdfs_train_line_filter,
+    hdfs_topology_fingerprints,
     indices_from_unit_split,
     save_unit_split,
     scan_hdfs_block_ids,
     stratified_id_split,
+    topology_grouped_id_split,
 )
 from src.modules.utils import get_device, seed_everything
 
@@ -314,6 +319,7 @@ def stage45_build_dataset(
                 idx_test,
                 sequence_ids=sequence_ids,
                 seed=int(config["experiment"]["seed"]),
+                protocol=split_protocol_from_config(config),
             )
         elif fit_on_from_config(config) == "train_only" and unit_split_path is not None:
             unit_split = json.loads(Path(unit_split_path).read_text())
@@ -326,6 +332,7 @@ def stage45_build_dataset(
                     idx_test,
                     sequence_ids=sequence_ids,
                     seed=int(config["experiment"]["seed"]),
+                    protocol=split_protocol_from_config(config),
                 )
             else:
                 idx_train = idx_val = idx_test = lock_id = None
@@ -344,6 +351,7 @@ def stage45_build_dataset(
                 idx_test,
                 sequence_ids=sequence_ids,
                 seed=int(config["experiment"]["seed"]),
+                protocol=split_protocol_from_config(config),
             )
 
         tfidf_fit_texts = None
@@ -413,7 +421,16 @@ def stage45_build_dataset(
             "n_raw": unique_stats["n_raw"],
             "n_unique": unique_stats["n_unique"],
             "n_mixed_label_fingerprints": unique_stats["n_mixed_label_fingerprints"],
+            "n_graphs_with_oov": int(
+                sum(OOV_CLUSTER_ID in set(map(int, item["cluster_ids"])) for item in structures)
+            ),
         }
+        meta["oov_graph_rate"] = float(meta["n_graphs_with_oov"] / len(structures))
+        if unit_split_path is not None:
+            unit_meta = json.loads(Path(unit_split_path).read_text())
+            for key in ("n_oov_lines", "n_annotated_lines", "oov_line_rate", "protocol"):
+                if key in unit_meta:
+                    meta[key] = unit_meta[key]
         graph_path = temp_dir / "graph_dataset.pt"
         save_graph_dataset(
             data_list,
@@ -480,6 +497,9 @@ def stage6_train(
             node_transformation=str(ablation_graph["node_transformation"]),
             structure_decoder=structure_decoder_from_config(config),
             node_reconstruct=node_reconstruct_from_config(config),
+            fusion_mode=fusion_mode_from_config(config),
+            modality_projection_dim=int(config["ablation"]["fusion"].get("modality_projection_dim", 64)),
+            node_loss=node_loss_from_config(config),
             bundle_meta=bundle_meta,
         )
         metrics_path = temp_dir / "metrics.json"
@@ -498,6 +518,10 @@ def stage6_train(
             "parent_graph": _workspace_relative(graph_path, workspace),
             "code_sha": git_revision(code),
             "feature_contract": feature_contract_from_config(config),
+            "seed": int(config["experiment"]["seed"]),
+            "split_protocol": split_protocol_from_config(config),
+            "oov_graph_rate": bundle_meta.get("oov_graph_rate"),
+            "oov_line_rate": bundle_meta.get("oov_line_rate"),
         }
         written = write_eval_pack(
             temp_dir,
@@ -508,6 +532,9 @@ def stage6_train(
             structure=eval_payload["structure"],
             node=eval_payload["node"],
             edge=eval_payload["edge"],
+            node_blocks={
+                name: eval_payload[name] for name in ("tfidf", "sbert", "extras")
+            },
             threshold=float(metrics["best_threshold"]),
             alpha=float(training["alpha"]),
             beta=float(training["beta"]),
@@ -834,13 +861,31 @@ def _stage1_artifacts(
                     )
                 block_ids = scan_hdfs_block_ids(raw_path)
                 mapping = _hdfs_label_mapping(labels_path)
-                unit_payload = {
-                    "kind": "hdfs_blocks",
-                    **stratified_id_split(
+                split_protocol = split_protocol_from_config(config)
+                if split_protocol == "topology_grouped":
+                    # The provisional parser is used only to define groups. The
+                    # final parser below is fresh and sees grouped-train lines only.
+                    provisional = DrainParser(config_path=str(parser_config))
+                    provisional.fit_file(str(raw_path))
+                    provisional_frame = provisional.annotate_file(
+                        str(raw_path), unmatched="skip"
+                    )
+                    unit_split = topology_grouped_id_split(
+                        block_ids,
+                        mapping,
+                        hdfs_topology_fingerprints(provisional_frame),
+                        seed=int(config["experiment"]["seed"]),
+                    )
+                else:
+                    unit_split = stratified_id_split(
                         block_ids,
                         mapping,
                         seed=int(config["experiment"]["seed"]),
-                    ),
+                    )
+                unit_payload = {
+                    "kind": "hdfs_blocks",
+                    "protocol": split_protocol,
+                    **unit_split,
                 }
                 include_line = hdfs_train_line_filter({str(item) for item in unit_payload["train"]})
             else:
@@ -875,6 +920,9 @@ def _stage1_artifacts(
             "parser_state": state_path,
         }
         if unit_payload is not None:
+            unit_payload["n_oov_lines"] = n_oov
+            unit_payload["n_annotated_lines"] = int(len(frame))
+            unit_payload["oov_line_rate"] = float(n_oov / len(frame)) if len(frame) else 0.0
             unit_path = temp_dir / "unit_split.json"
             save_unit_split(unit_path, unit_payload)
             outputs["unit_split"] = unit_path
@@ -899,6 +947,9 @@ def _train_graph_bundle(
     node_transformation: str,
     structure_decoder: str,
     node_reconstruct: str = "all",
+    fusion_mode: str = "concat",
+    modality_projection_dim: int = 64,
+    node_loss: tuple[str, dict[str, float]] = ("global", {}),
     bundle_meta: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     import torch
@@ -964,6 +1015,12 @@ def _train_graph_bundle(
             split_meta=split_meta,
             bundle_meta=bundle_meta,
         ),
+        tfidf_dim=int(bundle_meta.get("tfidf_dim") or split_meta.get("tfidf_dim") or 0),
+        sbert_dim=int(bundle_meta.get("sbert_dim") or split_meta.get("sbert_dim") or 0),
+        fusion_mode=fusion_mode,
+        modality_projection_dim=modality_projection_dim,
+        node_loss_mode=node_loss[0],
+        node_block_weights=node_loss[1],
     ).to(device)
     optimizer = Adam(model.parameters(), lr=float(training["learning_rate"]))
     loss_args = {
@@ -1052,6 +1109,12 @@ def _train_graph_bundle(
         "node_reconstruct": node_reconstruct,
         "node_recon_dim": int(model.node_recon_index.numel()),
         "node_recon_index": model.node_recon_index.detach().cpu().tolist(),
+        "tfidf_dim": model.tfidf_dim,
+        "sbert_dim": model.sbert_dim,
+        "fusion_mode": fusion_mode,
+        "modality_projection_dim": modality_projection_dim,
+        "node_loss_mode": node_loss[0],
+        "node_block_weights": node_loss[1],
     }
     metrics["history"] = _loss_history(history)
     eval_payload = {
@@ -1060,6 +1123,9 @@ def _train_graph_bundle(
         "structure": test_components["structure"],
         "node": test_components["node"],
         "edge": test_components["edge"],
+        "tfidf": test_components["tfidf"],
+        "sbert": test_components["sbert"],
+        "extras": test_components["extras"],
         "graph_ids": test_ids,
     }
     return metrics, checkpoint, eval_payload
@@ -1423,6 +1489,9 @@ def _stage6_config(config: dict[str, Any]) -> dict[str, Any]:
         "node_transformation": ablation_graph["node_transformation"],
         "structure_decoder": structure_decoder_from_config(config),
         "node_reconstruct": node_reconstruct_from_config(config),
+        "fusion_mode": fusion_mode_from_config(config),
+        "modality_projection_dim": int(config["ablation"]["fusion"].get("modality_projection_dim", 64)),
+        "node_loss": node_loss_from_config(config),
     }
 
 
@@ -1504,7 +1573,7 @@ def _serialisable_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def _workspace_relative(path: Path, workspace: Path) -> str:
     try:
-        return str(path.resolve().relative_to(workspace))
+        return path.resolve().relative_to(workspace).as_posix()
     except ValueError:
         return str(path.resolve())
 
@@ -1762,6 +1831,7 @@ def prepare_representation_campaign(
         "matrix": str(matrix_file),
         "templates": _optional_workspace_relative(templates, workspace, previous.get("templates")),
         "sequences": _optional_workspace_relative(sequences, workspace, previous.get("sequences")),
+        "seeds": [int(seed) for seed in (matrix.get("seeds") or [config["experiment"]["seed"]])],
     }
     manifest_path = write_campaign_manifest(
         destination,
@@ -1802,7 +1872,8 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
     matrix_path = Path(args.matrix).resolve()
     matrix = load_matrix(matrix_path)
     experiments = enabled_experiments(matrix)
-    if not experiments:
+    pairs = experiment_seed_pairs(matrix, int(base_config["experiment"]["seed"]))
+    if not pairs:
         raise ValueError(f"No experiments found in {matrix_path}")
     if (
         args.mode == "train-only"
@@ -1818,7 +1889,7 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
     dataset = _dataset(base_config)
     workspace = Path(args.workspace_root).resolve()
     campaign_id = args.campaign_id or args.run_id
-    for experiment in experiments:
+    for experiment, seed in pairs:
         name = experiment["name"]
         config = apply_overrides(
             base_config,
@@ -1831,13 +1902,18 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
             config["experiment"]["run_id"] = f"{args.run_id}_{name}"
         config["experiment"]["family"] = matrix.get("family") or config["experiment"].get("family")
         config["experiment"]["name"] = name
+        config["experiment"]["seed"] = seed
+        if campaign_id:
+            config["experiment"]["run_id"] = (
+                f"{_safe_name(campaign_id)}_{_safe_name(name)}_seed{seed}"
+            )
         run_id = get_run_tag(config)
         existing = _completed_run_dir(
             workspace, dataset, run_id, expected_config=config
         )
         if existing is not None:
             metrics = json.loads((existing / "metrics.json").read_text())
-            results.append({"name": name, "status": "OK", "reused": True, **metrics})
+            results.append({"name": name, "seed": seed, "status": "OK", "reused": True, **metrics})
             print(f"[SKIP] {name} already completed at {existing}")
             continue
         graph_dataset = args.graph_dataset
@@ -1868,6 +1944,7 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
             results.append(
                 {
                     "name": name,
+                    "seed": seed,
                     "status": "OK",
                     **record["metrics"],
                     "history": record["history"],
@@ -1877,6 +1954,7 @@ def _run_matrix(args: argparse.Namespace, base_config: dict[str, Any]) -> int:
             results.append(
                 {
                     "name": name,
+                    "seed": seed,
                     "status": "FAILED",
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
@@ -1903,9 +1981,9 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
     results: list[dict[str, Any]] = []
     staged_uncompressed: Path | None = None
     try:
+        seeds = [int(seed) for seed in (manifest.get("seeds") or [base_config["experiment"]["seed"]])]
         for graph_entry in manifest.get("graphs") or []:
             name = graph_entry["name"]
-            run_id = f"{_safe_name(campaign_id)}_{_safe_name(name)}"
             overrides = [f"experiment.name={name}"]
             identity = graph_entry.get("identity") or {}
             if "llm_enrichment_enabled" in identity:
@@ -1932,6 +2010,14 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
                 overrides.append(
                     f"ablation.graph.unique_sequences={json.dumps(identity['unique_sequences'])}"
                 )
+            if identity.get("fit_on"):
+                overrides.append(
+                    f"ablation.representation.fit_on={json.dumps(identity['fit_on'])}"
+                )
+            if identity.get("split_protocol"):
+                overrides.append(
+                    f"sequencing.{dataset}.split={json.dumps(identity['split_protocol'])}"
+                )
             if identity.get("sbert_text"):
                 overrides.append(
                     f"ablation.embeddings.sbert_text={json.dumps(identity['sbert_text'])}"
@@ -1944,52 +2030,61 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
                 overrides.append(
                     f"ablation.feature_contract={json.dumps(identity['feature_contract'])}"
                 )
-            config = apply_overrides(base_config, overrides)
-            config["experiment"]["campaign_id"] = campaign_id
-            config["experiment"]["family"] = "representation"
-            config["experiment"]["run_id"] = run_id
-            config["experiment"]["name"] = name
-            existing = _completed_run_dir(
-                workspace, dataset, run_id, expected_config=config
-            )
-            if existing is not None:
-                metrics = json.loads((existing / "metrics.json").read_text())
-                results.append({"name": name, "status": "OK", "reused": True, **metrics})
-                print(f"[SKIP] {name}")
-                continue
             relative = graph_entry["graph_dataset"]
             compressed = campaign_dir / relative
             if not compressed.exists():
                 compressed = Path(relative)
             if staged_uncompressed is not None and staged_uncompressed.exists():
                 staged_uncompressed.unlink()
-            uncompressed = workspace / "data" / "processed" / dataset / f"{run_id}_graph_dataset.pt"
-            staged_uncompressed = gunzip_file(compressed, uncompressed)
+            staged_uncompressed = workspace / "data" / "processed" / dataset / (
+                f"{_safe_name(campaign_id)}_{_safe_name(name)}_graph_dataset.pt"
+            )
+            staged_uncompressed = gunzip_file(compressed, staged_uncompressed)
             meta_relative = graph_entry.get("dataset_meta")
             if meta_relative:
                 meta_source = campaign_dir / meta_relative
                 if meta_source.exists():
-                    shutil.copy2(meta_source, staged_uncompressed.with_name("dataset_meta.json"))
-            try:
-                record = run_experiment(
-                    config,
-                    mode="train-only",
-                    workspace_root=workspace,
-                    code_root=args.code_root,
-                    graph_dataset=staged_uncompressed,
-                    checkpoint_root=args.checkpoint_root,
+                    shutil.copy2(
+                        meta_source, staged_uncompressed.with_name("dataset_meta.json")
+                    )
+
+            for seed in seeds:
+                run_id = f"{_safe_name(campaign_id)}_{_safe_name(name)}_seed{seed}"
+                config = apply_overrides(base_config, overrides)
+                config["experiment"]["campaign_id"] = campaign_id
+                config["experiment"]["family"] = "representation"
+                config["experiment"]["run_id"] = run_id
+                config["experiment"]["name"] = name
+                config["experiment"]["seed"] = seed
+                existing = _completed_run_dir(
+                    workspace, dataset, run_id, expected_config=config
                 )
-                results.append({"name": name, "status": "OK", **record["metrics"], "history": record["history"]})
-            except Exception as exc:
-                results.append(
-                    {
-                        "name": name,
-                        "status": "FAILED",
-                        "error": str(exc),
-                        "traceback": traceback.format_exc(),
-                    }
-                )
-            _checkpoint_workspace(workspace, args.checkpoint_root)
+                if existing is not None:
+                    metrics = json.loads((existing / "metrics.json").read_text())
+                    results.append({"name": name, "seed": seed, "status": "OK", "reused": True, **metrics})
+                    print(f"[SKIP] {name} seed={seed}")
+                    continue
+                try:
+                    record = run_experiment(
+                        config,
+                        mode="train-only",
+                        workspace_root=workspace,
+                        code_root=args.code_root,
+                        graph_dataset=staged_uncompressed,
+                        checkpoint_root=args.checkpoint_root,
+                    )
+                    results.append({"name": name, "seed": seed, "status": "OK", **record["metrics"], "history": record["history"]})
+                except Exception as exc:
+                    results.append(
+                        {
+                            "name": name,
+                            "seed": seed,
+                            "status": "FAILED",
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                _checkpoint_workspace(workspace, args.checkpoint_root)
     finally:
         if staged_uncompressed is not None and staged_uncompressed.exists():
             staged_uncompressed.unlink()
@@ -2177,9 +2272,35 @@ def main() -> int:
         )
         if baseline is None:
             raise FileNotFoundError("Campaign has no baseline_full graph for Family B.")
+        identity = baseline.get("identity") or {}
+        identity_overrides: list[str] = []
+        identity_paths = {
+            "llm_enrichment_enabled": "ablation.llm_enrichment_enabled",
+            "enrichment_model_size": "ablation.enrichment_model_size",
+            "tfidf_enabled": "ablation.embeddings.tfidf_enabled",
+            "sbert_enabled": "ablation.embeddings.sbert_enabled",
+            "use_edge_features": "ablation.graph.use_edge_features",
+            "feature_contract": "ablation.feature_contract",
+            "unique_sequences": "ablation.graph.unique_sequences",
+            "fit_on": "ablation.representation.fit_on",
+            "sbert_text": "ablation.embeddings.sbert_text",
+        }
+        for key, dotted in identity_paths.items():
+            if key in identity and identity[key] is not None:
+                identity_overrides.append(f"{dotted}={json.dumps(identity[key])}")
+        if identity.get("split_protocol"):
+            identity_overrides.append(
+                f"sequencing.{_dataset(config)}.split={json.dumps(identity['split_protocol'])}"
+            )
+        config = apply_overrides(config, identity_overrides)
         compressed = Path(args.campaign_dir).resolve() / baseline["graph_dataset"]
         uncompressed = Path(args.workspace_root).resolve() / "data" / "processed" / _dataset(config) / "baseline_full_graph_dataset.pt"
         args.graph_dataset = gunzip_file(compressed, uncompressed)
+        meta_relative = baseline.get("dataset_meta")
+        if meta_relative:
+            meta_source = Path(args.campaign_dir).resolve() / meta_relative
+            if meta_source.exists():
+                shutil.copy2(meta_source, uncompressed.with_name("dataset_meta.json"))
         if args.matrix is None:
             args.matrix = Path(args.code_root) / "configs" / "ablation_train.yaml"
         if args.campaign_id is None:

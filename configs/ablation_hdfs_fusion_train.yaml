@@ -1,0 +1,38 @@
+# HDFS train-only follow-up. Run on baseline_full from the matching Family A
+# campaign, never on an older topology-only graph. All arms share graph tensors,
+# graph IDs, split_lock, preprocessing, and five paired training seeds.
+family: train
+requires_graph_rebuild: false
+seeds: [13, 29, 42, 71, 101]
+experiments:
+  - name: hybrid_projected_gated
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: hybrid_projected_gated
+      ablation.fusion.mode: projected_gated
+      ablation.fusion.modality_projection_dim: 64
+
+  - name: hybrid_lexical_recon
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: hybrid_lexical_recon
+      ablation.fusion.node_reconstruct: without_sbert
+
+  - name: hybrid_block_balanced
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: hybrid_block_balanced
+      ablation.fusion.node_loss: block_balanced
+      ablation.fusion.node_block_weights.tfidf: 1.0
+      ablation.fusion.node_block_weights.sbert: 1.0
+      ablation.fusion.node_block_weights.extras: 1.0
+
+  - name: alpha_0
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: alpha_0
+      training.alpha: 0.0

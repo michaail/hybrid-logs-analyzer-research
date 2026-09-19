@@ -73,15 +73,16 @@ def fit_on_from_config(config: Mapping[str, Any]) -> str:
 
 
 def split_protocol_from_config(config: Mapping[str, Any]) -> str:
-    """Graph/window split protocol. HDFS is always block-stratified."""
+    """Graph/window split protocol."""
     experiment = config.get("experiment") or {}
     dataset = str(experiment.get("dataset") or "bgl").lower()
-    if dataset != "bgl":
-        return "stratified"
-    sequencing = (config.get("sequencing") or {}).get("bgl") or {}
+    sequencing = (config.get("sequencing") or {}).get(dataset) or {}
     value = str(sequencing.get("split") or "stratified").lower()
-    if value not in {"time", "stratified"}:
-        raise ValueError(f"sequencing.bgl.split must be 'time' or 'stratified', got {value!r}")
+    allowed = {"time", "stratified"} if dataset == "bgl" else {"stratified", "topology_grouped"}
+    if value not in allowed:
+        raise ValueError(
+            f"sequencing.{dataset}.split must be one of {sorted(allowed)}, got {value!r}"
+        )
     return value
 
 
@@ -116,6 +117,35 @@ def node_reconstruct_from_config(config: Mapping[str, Any]) -> str:
             f"ablation.fusion.node_reconstruct must be 'all' or 'without_sbert', got {value!r}"
         )
     return value
+
+
+def fusion_mode_from_config(config: Mapping[str, Any]) -> str:
+    """Node input fusion: historical concat or projected gated modalities."""
+    fusion = ((config.get("ablation") or {}).get("fusion")) or {}
+    value = str(fusion.get("mode") or "concat").lower()
+    if value not in {"concat", "projected_gated"}:
+        raise ValueError(
+            f"ablation.fusion.mode must be 'concat' or 'projected_gated', got {value!r}"
+        )
+    return value
+
+
+def node_loss_from_config(config: Mapping[str, Any]) -> tuple[str, dict[str, float]]:
+    """Return node-loss reduction and modality weights."""
+    fusion = ((config.get("ablation") or {}).get("fusion")) or {}
+    mode = str(fusion.get("node_loss") or "global").lower()
+    if mode not in {"global", "block_balanced"}:
+        raise ValueError(
+            "ablation.fusion.node_loss must be 'global' or 'block_balanced', "
+            f"got {mode!r}"
+        )
+    raw = fusion.get("node_block_weights") or {}
+    weights = {
+        name: float(raw.get(name, 1.0)) for name in ("tfidf", "sbert", "extras")
+    }
+    if any(value < 0 for value in weights.values()):
+        raise ValueError("Node block weights must be non-negative.")
+    return mode, weights
 
 
 def graph_identity_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -262,6 +292,7 @@ def save_split_lock(
     *,
     sequence_ids: list[str] | None = None,
     seed: int | None = None,
+    protocol: str | None = None,
 ) -> str:
     """Persist a frozen 70/15/15 split and return its id."""
     path = Path(path)
@@ -276,6 +307,8 @@ def save_split_lock(
     }
     if seed is not None:
         payload["seed"] = np.int64(seed)
+    if protocol is not None:
+        payload["protocol"] = np.asarray(protocol)
     if sequence_ids is not None:
         payload["sequence_ids"] = np.asarray(sequence_ids)
     np.savez_compressed(path, **payload)
@@ -297,6 +330,8 @@ def load_split_lock(path: str | Path) -> dict[str, Any]:
             lock["sequence_ids"] = [str(item) for item in payload["sequence_ids"].tolist()]
         if "seed" in payload.files:
             lock["seed"] = int(payload["seed"])
+        if "protocol" in payload.files:
+            lock["protocol"] = str(payload["protocol"])
     if lock["split_lock_id"] is None:
         lock["split_lock_id"] = split_lock_id(
             lock["idx_train"], lock["idx_val"], lock["idx_test"]
@@ -447,6 +482,21 @@ def enabled_experiments(matrix: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [item for item in experiments if item.get("enabled", True)]
 
 
+def experiment_seed_pairs(
+    matrix: Mapping[str, Any], default_seed: int
+) -> list[tuple[dict[str, Any], int]]:
+    """Cartesian product of enabled arms and declared training seeds."""
+    raw_seeds = matrix.get("seeds") or [default_seed]
+    seeds = [int(seed) for seed in raw_seeds]
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("Matrix seeds must be unique.")
+    return [
+        (experiment, seed)
+        for experiment in enabled_experiments(matrix)
+        for seed in seeds
+    ]
+
+
 def experiment_requires_graph_rebuild(
     experiment: Mapping[str, Any],
     matrix: Mapping[str, Any] | None = None,
@@ -480,6 +530,7 @@ def component_metrics(
     alpha: float,
     beta: float,
     gamma: float,
+    node_blocks: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """PR/ROC for each reconstruction head plus TP dominance shares."""
     metrics: dict[str, Any] = {
@@ -488,11 +539,23 @@ def component_metrics(
         "node": _component_aucs(labels, node),
         "edge": _component_aucs(labels, edge),
     }
+    for name, values in (node_blocks or {}).items():
+        array = np.asarray(values)
+        metrics[name] = {
+            **_component_aucs(labels, array),
+            "mean_normal": float(array[labels == 0].mean()) if (labels == 0).any() else 0.0,
+            "mean_anomaly": float(array[labels == 1].mean()) if (labels == 1).any() else 0.0,
+        }
     weighted = np.column_stack(
         [alpha * structure, beta * node, gamma * edge]
     )
     totals = weighted.sum(axis=1, keepdims=True)
-    shares = np.divide(weighted, np.maximum(totals, 1e-12), where=totals > 0)
+    shares = np.divide(
+        weighted,
+        np.maximum(totals, 1e-12),
+        out=np.zeros_like(weighted, dtype=float),
+        where=totals > 0,
+    )
     true_positives = (labels == 1) & (predictions == 1)
     if true_positives.any():
         mean_share = shares[true_positives].mean(axis=0)
@@ -530,6 +593,7 @@ def write_eval_pack(
     alpha: float,
     beta: float,
     gamma: float,
+    node_blocks: Mapping[str, np.ndarray] | None = None,
     graph_ids: list[str] | None = None,
     config: Mapping[str, Any] | None = None,
     campaign_meta: Mapping[str, Any] | None = None,
@@ -556,6 +620,7 @@ def write_eval_pack(
         alpha=alpha,
         beta=beta,
         gamma=gamma,
+        node_blocks=node_blocks,
     )
     component_path = output_dir / "component_metrics.json"
     component_path.write_text(json.dumps(components, indent=2))
@@ -570,8 +635,7 @@ def write_eval_pack(
     else:
         config_path = output_dir / "config.yaml"
 
-    score_frame = pd.DataFrame(
-        {
+    score_columns: dict[str, Any] = {
             "graph_id": graph_ids if graph_ids is not None else list(range(len(labels))),
             "label": labels.astype(int),
             "prediction": predictions,
@@ -582,8 +646,10 @@ def write_eval_pack(
             "weighted_structure": alpha * structure,
             "weighted_node": beta * node,
             "weighted_edge": gamma * edge,
-        }
-    )
+    }
+    for name, values in (node_blocks or {}).items():
+        score_columns[name] = np.asarray(values)
+    score_frame = pd.DataFrame(score_columns)
     scores_csv = scores_dir / "test_component_scores.csv"
     score_frame.to_csv(scores_csv, index=False)
 
@@ -801,6 +867,10 @@ def write_campaign_report(
                 "dataset": dataset,
                 "campaign_id": campaign_id,
                 "family": manifest.get("family"),
+                "seed": manifest.get("seed", metrics.get("seed")),
+                "split_protocol": manifest.get("split_protocol"),
+                "oov_graph_rate": manifest.get("oov_graph_rate"),
+                "oov_line_rate": manifest.get("oov_line_rate"),
                 "run_dir": str(run_dir),
                 "test_f1": metrics.get("test_f1"),
                 "test_pr_auc": metrics.get("test_pr_auc"),
@@ -831,6 +901,10 @@ def write_campaign_report(
     frame.drop(columns=["component_metrics", "history"], errors="ignore").to_csv(csv_path, index=False)
     json_path.write_text(json.dumps(records, indent=2, default=str))
 
+    summary_frame, paired_frame = _seeded_campaign_statistics(frame, baseline_name)
+    summary_frame.to_csv(campaign_dir / "summary_by_arm.csv", index=False)
+    paired_frame.to_csv(campaign_dir / "paired_bootstrap_ci.csv", index=False)
+
     baseline_rows = frame[frame["name"] == baseline_name]
     delta_path = campaign_dir / "delta_vs_baseline.csv"
     if not baseline_rows.empty:
@@ -854,6 +928,54 @@ def write_campaign_report(
     readme = campaign_dir / "README.md"
     readme.write_text(_campaign_readme(campaign_id, dataset, frame, baseline_name))
     return json_path
+
+
+def _seeded_campaign_statistics(
+    frame: pd.DataFrame,
+    baseline_name: str,
+    *,
+    bootstrap_samples: int = 10_000,
+    bootstrap_seed: int = 2026,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mean/std by arm and paired seed-bootstrap deltas vs baseline."""
+    metrics = ("test_f1", "test_pr_auc", "test_roc_auc")
+    summary_rows: list[dict[str, Any]] = []
+    for name, group in frame.groupby("name", sort=True):
+        row: dict[str, Any] = {"name": name, "n_seeds": int(group["seed"].nunique())}
+        for metric in metrics:
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            row[f"{metric}_mean"] = float(values.mean()) if len(values) else np.nan
+            row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        summary_rows.append(row)
+
+    paired_rows: list[dict[str, Any]] = []
+    baseline = frame[frame["name"] == baseline_name]
+    if not baseline.empty and baseline["seed"].notna().all():
+        rng = np.random.default_rng(bootstrap_seed)
+        for name, group in frame.groupby("name", sort=True):
+            merged = baseline[["seed", *metrics]].merge(
+                group[["seed", *metrics]], on="seed", suffixes=("_baseline", "_arm")
+            )
+            for metric in metrics:
+                delta = (
+                    pd.to_numeric(merged[f"{metric}_arm"], errors="coerce")
+                    - pd.to_numeric(merged[f"{metric}_baseline"], errors="coerce")
+                ).dropna().to_numpy(dtype=float)
+                if not len(delta):
+                    continue
+                sampled = rng.choice(delta, size=(bootstrap_samples, len(delta)), replace=True).mean(axis=1)
+                paired_rows.append(
+                    {
+                        "name": name,
+                        "metric": metric,
+                        "n_paired_seeds": int(len(delta)),
+                        "mean_delta": float(delta.mean()),
+                        "ci95_low": float(np.quantile(sampled, 0.025)),
+                        "ci95_high": float(np.quantile(sampled, 0.975)),
+                        "bootstrap_unit": "training_seed",
+                    }
+                )
+    return pd.DataFrame(summary_rows), pd.DataFrame(paired_rows)
 
 
 def _history_from_epochs(history: Any) -> dict[str, list[float]]:

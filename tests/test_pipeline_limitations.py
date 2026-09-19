@@ -338,6 +338,48 @@ def test_without_sbert_decoder_skips_sbert_columns() -> None:
 
 
 @pytest.mark.ml
+def test_projected_gated_fusion_and_balanced_node_loss() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    import torch
+    from torch.optim import Adam
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    from src.modules.models.gae import AttributeAwareGAE, compute_anomaly_scores, train_epoch
+
+    graph = Data(
+        x=torch.randn(5, 12),
+        edge_index=torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long),
+        edge_attr=torch.randn(4, 2),
+        y=torch.tensor([0]),
+        num_nodes=5,
+    )
+    loader = DataLoader([graph], batch_size=1)
+    model = AttributeAwareGAE(
+        node_dim=12,
+        edge_dim=2,
+        hidden_dim=8,
+        latent_dim=4,
+        tfidf_dim=4,
+        sbert_dim=5,
+        fusion_mode="projected_gated",
+        modality_projection_dim=6,
+        node_loss_mode="block_balanced",
+    )
+    assert set(model.modality_projectors) == {"tfidf", "sbert", "extras"}
+    optimizer = Adam(model.parameters(), lr=0.01)
+    total, _, node, _ = train_epoch(model, loader, optimizer, torch.device("cpu"))
+    assert np.isfinite(total) and np.isfinite(node)
+    _, _, components, _ = compute_anomaly_scores(
+        model, loader, torch.device("cpu"), return_components=True
+    )
+    assert components["tfidf"].shape == (1,)
+    assert components["sbert"].shape == (1,)
+    assert components["extras"].shape == (1,)
+
+
+@pytest.mark.ml
 def test_graph_directory_dataset_roundtrip(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     import torch
