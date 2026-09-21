@@ -5,11 +5,22 @@ Run from this repository root or from ``7_AblationStudy_BGL_Colab.ipynb``
 (``RUN_PREPARE=True``). Training is a separate ``--mode train-only`` step.
 Enrichment uses the large model only.
 
+The published LLM+PB3 campaign prepares two matrices into the same
+``--campaign-id`` (LLM closed first, then PB3). A PB3-only prepare does
+not create ``hybrid_llm``, which is the PB3 baseline and Isolation Forest
+bundle.
+
 Example::
 
     python scripts/prepare_bgl_campaign.py \\
-        --campaign-id bgl_ablation_20260917 \\
-        --workspace-root /path/to/workspace
+        --campaign-id bgl-full-monty-v1 \\
+        --workspace-root . \\
+        --matrix configs/ablation_bgl_llm_closed.yaml
+
+    python scripts/prepare_bgl_campaign.py \\
+        --campaign-id bgl-full-monty-v1 \\
+        --workspace-root . \\
+        --matrix configs/ablation_bgl_pb3.yaml
 """
 
 from __future__ import annotations

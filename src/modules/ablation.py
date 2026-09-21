@@ -833,12 +833,39 @@ def _write_eval_figures(
     return written
 
 
+def resolve_campaign_baseline_name(
+    records: list[Mapping[str, Any]] | pd.DataFrame | None = None,
+    *,
+    dataset: str,
+    baseline_name: str | None = None,
+) -> str:
+    """Pick the paired-delta baseline for a campaign leaderboard.
+
+    BGL LLM+PB3 campaigns compare against ``hybrid_llm``. Older HDFS/BGL
+    representation matrices keep ``baseline_full``. An explicit *baseline_name*
+    always wins.
+    """
+    if baseline_name:
+        return str(baseline_name)
+    names: set[str] = set()
+    if isinstance(records, pd.DataFrame):
+        if "name" in records.columns:
+            names = {str(item) for item in records["name"].tolist()}
+    elif records:
+        names = {str(item.get("name")) for item in records if item.get("name")}
+    if "hybrid_llm" in names:
+        return "hybrid_llm"
+    if "baseline_full" in names:
+        return "baseline_full"
+    return "hybrid_llm" if str(dataset).lower() == "bgl" else "baseline_full"
+
+
 def write_campaign_report(
     workspace: str | Path,
     *,
     dataset: str,
     campaign_id: str,
-    baseline_name: str = "baseline_full",
+    baseline_name: str | None = None,
 ) -> Path:
     """Build leaderboard + comparison plots from completed run directories."""
     workspace = Path(workspace)
@@ -903,6 +930,9 @@ def write_campaign_report(
             f"No completed runs found for campaign {campaign_id!r} under {output_root}"
         )
 
+    baseline_name = resolve_campaign_baseline_name(
+        records, dataset=dataset, baseline_name=baseline_name
+    )
     frame = pd.DataFrame(records)
     for column in ("test_f1", "test_pr_auc", "test_roc_auc"):
         if column in frame.columns:
@@ -1178,6 +1208,10 @@ def _campaign_readme(
         f"# {dataset.upper()} ablation campaign `{campaign_id}`",
         "",
         f"Generated {generated}. Primary ranking metric: **test PR-AUC**.",
+        "",
+        "PR-AUC is threshold-free; chance is the positive-class rate, not 0.5. "
+        "Test F1 uses the validation-F1 threshold (one operating point). "
+        "ROC-AUC is secondary (chance = 0.5) and can look strong under class imbalance.",
         "",
         "| name | test_f1 | test_pr_auc | test_roc_auc | val_f1 |",
         "|---|---:|---:|---:|---:|",

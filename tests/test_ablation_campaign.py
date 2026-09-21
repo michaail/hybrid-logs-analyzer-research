@@ -26,6 +26,7 @@ from src.modules.ablation import (
     load_split_lock,
     save_split_lock,
     unique_sequences_from_config,
+    resolve_campaign_baseline_name,
     write_campaign_report,
     write_eval_pack,
     _seeded_campaign_statistics,
@@ -114,6 +115,8 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     prepare = (REPOSITORY_ROOT / "scripts" / "prepare_bgl_campaign.py").read_text()
     assert "experiment.dataset=bgl" in prepare
     assert "ablation_representation_bgl.yaml" in prepare
+    assert "ablation_bgl_llm_closed.yaml" in prepare
+    assert "ablation_bgl_pb3.yaml" in prepare
     assert "ablation.enrichment_model_size=large" in prepare
     run_ablation_src = (REPOSITORY_ROOT / "run_ablation.py").read_text()
     assert 'else "both"' not in run_ablation_src
@@ -143,6 +146,29 @@ def test_bgl_closing_matrices_have_five_paired_seeds_and_controls() -> None:
     }
     assert len(experiment_seed_pairs(llm, 42)) == 25
     assert len(experiment_seed_pairs(pb3, 42)) == 15
+
+
+def test_bgl_full_monty_protocol_docs_use_hybrid_llm_and_fit_on_all() -> None:
+    ablation = (REPOSITORY_ROOT / "notebooks" / "ABLATION.md").read_text()
+    assert "ablation_bgl_llm_closed.yaml" in ablation
+    assert "ablation_bgl_pb3.yaml" in ablation
+    assert "hybrid_llm" in ablation
+    assert "isolation-forest" in ablation
+    assert "positive-class rate" in ablation
+    assert "fit_on_by_dataset.bgl: all" in ablation
+    colab = (REPOSITORY_ROOT / "notebooks" / "7_AblationStudy_BGL_Colab.ipynb").read_text()
+    assert "train-only Drain/TF-IDF" not in colab
+    assert "fit_on_by_dataset.bgl: all" in colab
+    assert resolve_campaign_baseline_name(
+        [{"name": "hybrid_llm"}, {"name": "no_temporal_or_positional_features"}],
+        dataset="bgl",
+    ) == "hybrid_llm"
+    assert resolve_campaign_baseline_name(
+        [{"name": "baseline_full"}, {"name": "tfidf_only"}],
+        dataset="hdfs",
+    ) == "baseline_full"
+    assert resolve_campaign_baseline_name(dataset="bgl") == "hybrid_llm"
+    assert resolve_campaign_baseline_name(dataset="hdfs") == "baseline_full"
 
 
 def test_graph_identity_tracks_feature_group_ablations() -> None:
@@ -341,6 +367,55 @@ def test_eval_pack_and_campaign_report(tmp_path: Path) -> None:
     assert leaderboard[0]["name"] == "baseline_full"
     assert (tmp_path / "outputs" / "hdfs" / "campaigns" / "camp" / "README.md").exists()
     assert (tmp_path / "outputs" / "hdfs" / "campaigns" / "camp" / "ablation_comparison.png").exists()
+    readme = (tmp_path / "outputs" / "hdfs" / "campaigns" / "camp" / "README.md").read_text()
+    assert "baseline_full **(baseline)**" in readme
+    assert "positive-class rate" in readme
+
+
+def test_bgl_campaign_report_marks_hybrid_llm_baseline(tmp_path: Path) -> None:
+    import pandas as pd
+
+    labels = np.array([0, 0, 1, 1], dtype=int)
+    scores = np.array([0.1, 0.2, 0.8, 0.9])
+    structure = np.array([0.4, 0.4, 0.4, 0.4])
+    node = np.array([0.1, 0.15, 0.7, 0.8])
+    edge = np.array([0.05, 0.1, 0.5, 0.6])
+    for name, pr_auc in (("hybrid_llm", 0.82), ("no_temporal_or_positional_features", 0.71)):
+        write_eval_pack(
+            tmp_path / "outputs" / "bgl" / f"fullmonty_{name}_seed13",
+            metrics={"test_f1": pr_auc, "test_pr_auc": pr_auc, "test_roc_auc": 0.9, "val_f1": 0.7},
+            history_epochs=[],
+            labels=labels,
+            scores=scores,
+            structure=structure,
+            node=node,
+            edge=edge,
+            threshold=0.5,
+            alpha=1.0,
+            beta=1.0,
+            gamma=1.0,
+            campaign_meta={
+                "campaign_id": "fullmonty",
+                "experiment_name": name,
+                "family": "representation",
+                "seed": 13,
+            },
+        )
+    summary = write_campaign_report(tmp_path, dataset="bgl", campaign_id="fullmonty")
+    readme = (tmp_path / "outputs" / "bgl" / "campaigns" / "fullmonty" / "README.md").read_text()
+    assert "hybrid_llm **(baseline)**" in readme
+    assert "no_temporal_or_positional_features **(baseline)**" not in readme
+    paired = pd.read_csv(tmp_path / "outputs" / "bgl" / "campaigns" / "fullmonty" / "paired_bootstrap_ci.csv")
+    assert {"hybrid_llm", "no_temporal_or_positional_features"} <= set(paired["name"])
+    arm_pr = paired[
+        (paired["name"] == "no_temporal_or_positional_features") & (paired["metric"] == "test_pr_auc")
+    ].iloc[0]
+    assert arm_pr["mean_delta"] < 0
+    leaderboard = json.loads(summary.read_text())
+    assert {row["name"] for row in leaderboard} == {
+        "hybrid_llm",
+        "no_temporal_or_positional_features",
+    }
 
 
 def test_seeded_statistics_are_paired_against_baseline() -> None:

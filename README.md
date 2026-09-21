@@ -21,7 +21,7 @@ notebooks/            # PROCESS, ABLATION, Colab runners
 
 Open notebooks from this repository root so `import src.modules` and
 `import modules` both resolve. Start with `notebooks/PROCESS.md` for the
-stage-by-stage narrative and `notebooks/ABLATION.md` for the HDFS campaign.
+stage-by-stage narrative and `notebooks/ABLATION.md` for the HDFS/BGL campaign.
 
 Local ML environment: `pip install -r requirements.txt` plus PyTorch / PyG.
 Do not install `requirements-colab.txt` on the Intel Mac baseline.
@@ -49,6 +49,13 @@ Preprocess locally, train on Colab, keep a comparable eval pack per config.
 Family A changes embeddings or graph tensors and **must not** share a single
 `--graph-dataset`. Family B may. Details: [`notebooks/ABLATION.md`](notebooks/ABLATION.md).
 Off-path notebooks: [`notebooks/ARCHIVE.md`](notebooks/ARCHIVE.md).
+
+## BGL ablation campaign
+
+Published research campaign: prepare `configs/ablation_bgl_llm_closed.yaml`
+then `configs/ablation_bgl_pb3.yaml` into the same campaign id, train Family A,
+then Isolation Forest. Rank by test PR-AUC vs `hybrid_llm`. Details:
+[`notebooks/ABLATION.md`](notebooks/ABLATION.md).
 
 ## Colab
 
