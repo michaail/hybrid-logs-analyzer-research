@@ -1,0 +1,69 @@
+# Pre-registered HDFS representation campaign (full-monty LLM-closed arms).
+# Drain + TF-IDF fit on the full unlabeled corpus, then a stratified block split.
+# Same arm names as ablation_bgl_llm_closed.yaml. Baseline is hybrid_llm.
+# Apply with prepare_hdfs_campaign.py --matrix this file (config_overrides
+# force fit_on=all before parse).
+family: representation
+requires_graph_rebuild: true
+seeds: [13, 29, 42, 71, 101]
+config_overrides:
+  experiment.dataset: hdfs
+  sequencing.hdfs.split: stratified
+  ablation.representation.fit_on: all
+  training.train_mode: clean
+experiments:
+  - name: tfidf_only
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: tfidf_only
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: false
+      ablation.graph.use_edge_features: true
+
+  - name: sbert_raw
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_raw
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: sbert_llm
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: sbert_llm
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: false
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: hybrid_raw
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: hybrid_raw
+      ablation.llm_enrichment_enabled: false
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+
+  - name: hybrid_llm
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: hybrid_llm
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true

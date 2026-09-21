@@ -152,6 +152,16 @@ def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, A
     return updated
 
 
+def matrix_config_override_strings(matrix: dict[str, Any]) -> list[str]:
+    """Flatten matrix ``config_overrides`` into ``KEY=JSON`` CLI-style strings."""
+    raw = matrix.get("config_overrides") or {}
+    if not raw:
+        return []
+    if not isinstance(raw, dict):
+        raise ValueError("Matrix config_overrides must be a mapping of dotted keys.")
+    return [f"{key}={json.dumps(value)}" for key, value in raw.items()]
+
+
 def get_run_tag(config: dict[str, Any]) -> str:
     """Return an explicit run id or a timestamped, human-readable one."""
     experiment = config["experiment"]
@@ -1831,6 +1841,10 @@ def prepare_representation_campaign(
     else:
         matrix_file = code / "configs" / "ablation_representation.yaml"
     matrix = load_matrix(matrix_file)
+    override_strings = matrix_config_override_strings(matrix)
+    if override_strings:
+        config = apply_overrides(config, override_strings)
+        dataset = _dataset(config)
     experiments = enabled_experiments(matrix)
     if arms:
         requested = {_safe_name(name) for name in arms}

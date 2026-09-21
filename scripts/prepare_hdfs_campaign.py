@@ -9,6 +9,16 @@ Example::
     python scripts/prepare_hdfs_campaign.py \\
         --campaign-id hdfs_ablation_20260916 \\
         --workspace-root /path/to/workspace
+
+    python scripts/prepare_hdfs_campaign.py \\
+        --campaign-id hdfs-full-monty-v1 \\
+        --workspace-root /path/to/workspace \\
+        --matrix configs/ablation_hdfs_llm_closed.yaml
+
+    python scripts/prepare_hdfs_campaign.py \\
+        --campaign-id hdfs-full-monty-v1 \\
+        --workspace-root /path/to/workspace \\
+        --matrix configs/ablation_hdfs_pb3.yaml
 """
 
 from __future__ import annotations

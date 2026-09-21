@@ -139,6 +139,37 @@ python scripts/drive_sync.py push \
   --dataset hdfs
 ```
 
+### Published HDFS full-monty campaign (transductive + stratified)
+
+Port of the BGL LLM-closed + PB3 arm set onto HDFS blocks. **Drain and TF-IDF fit on the full unlabeled log**, then a **stratified 70/15/15 block split** (`sequencing.hdfs.split: stratified`, `ablation.representation.fit_on: all`). Clean-train GAE, five seeds, baseline `hybrid_llm`. This is **not** the inductive HDFS default in `ablation_base.yaml` (`fit_on: train_only`).
+
+Self-contained notebook (inlined prepare + train, no `src.modules` / `run_ablation` imports): [`Ablation_HDFS_Full_Monty.ipynb`](./Ablation_HDFS_Full_Monty.ipynb). Colab prepare uses sentence-transformers 5.x; a local prepare uses 2.2.2. Do **not** mix those graph bundles under one campaign id.
+
+CLI equivalent (matrix `config_overrides` force `fit_on=all` before parse):
+
+```bash
+python3 scripts/prepare_hdfs_campaign.py \
+  --campaign-id hdfs-full-monty-v1 \
+  --workspace-root . \
+  --matrix configs/ablation_hdfs_llm_closed.yaml
+
+python3 scripts/prepare_hdfs_campaign.py \
+  --campaign-id hdfs-full-monty-v1 \
+  --workspace-root . \
+  --matrix configs/ablation_hdfs_pb3.yaml
+```
+
+Then train Family A, Isolation Forest, and the report (`experiment.dataset=hdfs`). Rank by test PR-AUC vs **`hybrid_llm`**. Chance is the HDFS positive-class rate (~0.03), not BGL’s ~0.099. Paired seed bootstrap applies; there is no BGL time-block CI on this stratified split. `SMOKE=True` caps prepare/train at 5000 graphs and 1 epoch — full HDFS is ~0.56M blocks.
+
+| Arm | What it tests |
+|---|---|
+| `tfidf_only` / `sbert_raw` / `sbert_llm` | Single embedding modality; raw Drain text vs LLM paragraph |
+| `hybrid_raw` vs `hybrid_llm` | **Primary LLM contrast** — same TF-IDF+SBERT GAE |
+| `no_positional_features` | Drop node/edge position stats |
+| `no_temporal_features` | Drop edge time-delta stats |
+| `no_temporal_or_positional_features` | **Primary PB3 contrast** vs `hybrid_llm` |
+| `isolation_forest` | Bag-of-templates counts on the same frozen `hybrid_llm` split |
+
 ## Colab train / eval
 
 1. Open [`7_AblationStudy_Colab.ipynb`](./7_AblationStudy_Colab.ipynb) for HDFS, or [`7_AblationStudy_BGL_Colab.ipynb`](./7_AblationStudy_BGL_Colab.ipynb) for BGL (clones this repository).

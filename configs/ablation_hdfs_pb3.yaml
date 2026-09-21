@@ -1,0 +1,61 @@
+# PB3 feature-group ablations for HDFS full-monty. Prepare with the same raw
+# data, frozen enrichment and split_lock.npz as ablation_hdfs_llm_closed.yaml.
+# Baseline is hybrid_llm from that campaign; this file contains the three
+# ablated arms. config_overrides keep Drain+TF-IDF transductive and the split
+# stratified even if ablation_base.yaml still defaults HDFS to train_only.
+family: representation
+requires_graph_rebuild: true
+seeds: [13, 29, 42, 71, 101]
+config_overrides:
+  experiment.dataset: hdfs
+  sequencing.hdfs.split: stratified
+  ablation.representation.fit_on: all
+  training.train_mode: clean
+experiments:
+  - name: no_positional_features
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: no_positional_features
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+      ablation.graph.node_positional_features: false
+      ablation.graph.edge_positional_features: false
+      ablation.graph.edge_temporal_features: true
+
+  - name: no_temporal_features
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: no_temporal_features
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+      ablation.graph.node_positional_features: true
+      ablation.graph.edge_positional_features: true
+      ablation.graph.edge_temporal_features: false
+
+  # Primary PB3 contrast: hybrid_llm with all feature groups versus this arm.
+  # Only transition count and non-positional node extras remain alongside the
+  # text embeddings and directed graph topology.
+  - name: no_temporal_or_positional_features
+    enabled: true
+    requires_graph_rebuild: true
+    overrides:
+      experiment.name: no_temporal_or_positional_features
+      ablation.llm_enrichment_enabled: true
+      ablation.enrichment_model_size: large
+      ablation.embeddings.tfidf_enabled: true
+      ablation.embeddings.sbert_enabled: true
+      ablation.embeddings.sbert_text: embedding_text
+      ablation.graph.use_edge_features: true
+      ablation.graph.node_positional_features: false
+      ablation.graph.edge_positional_features: false
+      ablation.graph.edge_temporal_features: false

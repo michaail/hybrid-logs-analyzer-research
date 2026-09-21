@@ -171,6 +171,62 @@ def test_bgl_full_monty_protocol_docs_use_hybrid_llm_and_fit_on_all() -> None:
     assert resolve_campaign_baseline_name(dataset="hdfs") == "baseline_full"
 
 
+def test_hdfs_full_monty_matrices_match_bgl_arms_and_force_fit_on_all() -> None:
+    from run_ablation import apply_overrides, load_config, matrix_config_override_strings
+
+    llm = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_hdfs_llm_closed.yaml")
+    pb3 = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_hdfs_pb3.yaml")
+    bgl_llm = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_bgl_llm_closed.yaml")
+    bgl_pb3 = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_bgl_pb3.yaml")
+    assert llm["seeds"] == pb3["seeds"] == [13, 29, 42, 71, 101]
+    assert {item["name"] for item in enabled_experiments(llm)} == {
+        item["name"] for item in enabled_experiments(bgl_llm)
+    }
+    assert {item["name"] for item in enabled_experiments(pb3)} == {
+        item["name"] for item in enabled_experiments(bgl_pb3)
+    }
+    for matrix in (llm, pb3):
+        overrides = matrix["config_overrides"]
+        assert overrides["experiment.dataset"] == "hdfs"
+        assert overrides["sequencing.hdfs.split"] == "stratified"
+        assert overrides["ablation.representation.fit_on"] == "all"
+        assert overrides["training.train_mode"] == "clean"
+        config = load_config(REPOSITORY_ROOT / "configs" / "ablation_base.yaml")
+        updated = apply_overrides(config, matrix_config_override_strings(matrix))
+        from src.modules.ablation import fit_on_from_config, split_protocol_from_config
+
+        assert updated["experiment"]["dataset"] == "hdfs"
+        assert fit_on_from_config(updated) == "all"
+        assert split_protocol_from_config(updated) == "stratified"
+        assert updated["training"]["train_mode"] == "clean"
+    prepare = (REPOSITORY_ROOT / "scripts" / "prepare_hdfs_campaign.py").read_text()
+    assert "ablation_hdfs_llm_closed.yaml" in prepare
+    assert "ablation_hdfs_pb3.yaml" in prepare
+    notebook_path = REPOSITORY_ROOT / "notebooks" / "Ablation_HDFS_Full_Monty.ipynb"
+    notebook_text = notebook_path.read_text()
+    assert "hdfs-full-monty-v1" in notebook_text
+    notebook = json.loads(notebook_text)
+    import ast
+
+    for item in notebook["cells"]:
+        if item.get("cell_type") != "code":
+            continue
+        source = "".join(item.get("source") or [])
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(alias.name.split(".", 1)[0] != "run_ablation" for alias in node.names)
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert not node.module.startswith("src"), item.get("id")
+    ablation = (REPOSITORY_ROOT / "notebooks" / "ABLATION.md").read_text()
+    assert "ablation_hdfs_llm_closed.yaml" in ablation
+    assert "hdfs-full-monty-v1" in ablation
+    assert resolve_campaign_baseline_name(
+        [{"name": "hybrid_llm"}, {"name": "tfidf_only"}],
+        dataset="hdfs",
+    ) == "hybrid_llm"
+
+
 def test_graph_identity_tracks_feature_group_ablations() -> None:
     baseline = _baseline_config()
     no_position = _baseline_config()
