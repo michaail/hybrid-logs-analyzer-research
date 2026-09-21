@@ -379,6 +379,13 @@ def test_campaign_preparation_preserves_previously_prepared_graph_entries() -> N
     assert "graphs=[merged_graphs[name] for name in sorted(merged_graphs)]" in source
 
 
+def test_graph_structure_cache_schema_tracks_isolation_forest_event_ids() -> None:
+    import run_ablation
+
+    config = _baseline_config()
+    assert run_ablation._stage45_structure_config(config)["structure_schema"] == "event_cluster_ids_v2"
+
+
 def test_bgl_time_block_bootstrap_reports_paired_ap_uncertainty(tmp_path: Path) -> None:
     import pandas as pd
 

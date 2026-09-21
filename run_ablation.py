@@ -1481,6 +1481,9 @@ def _stage45_config(config: dict[str, Any]) -> dict[str, Any]:
 def _stage45_structure_config(config: dict[str, Any]) -> dict[str, Any]:
     """Knobs that require rebuilding collapsed topology / extras / time-deltas."""
     return {
+        # v2 persists event-level template IDs needed by the Isolation Forest
+        # baseline. This explicit key prevents reuse of older structure caches.
+        "structure_schema": "event_cluster_ids_v2",
         "dataset": _dataset(config),
         "unique_sequences": unique_sequences_from_config(config),
         "feature_contract": feature_contract_from_config(config),
