@@ -139,9 +139,10 @@ def test_bgl_closing_matrices_have_five_paired_seeds_and_controls() -> None:
     }
     assert {item["name"] for item in enabled_experiments(pb3)} == {
         "no_positional_features", "no_temporal_features",
+        "no_temporal_or_positional_features",
     }
     assert len(experiment_seed_pairs(llm, 42)) == 25
-    assert len(experiment_seed_pairs(pb3, 42)) == 10
+    assert len(experiment_seed_pairs(pb3, 42)) == 15
 
 
 def test_graph_identity_tracks_feature_group_ablations() -> None:
