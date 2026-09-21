@@ -205,6 +205,16 @@ def test_hdfs_full_monty_matrices_match_bgl_arms_and_force_fit_on_all() -> None:
     notebook_path = REPOSITORY_ROOT / "notebooks" / "Ablation_HDFS_Full_Monty.ipynb"
     notebook_text = notebook_path.read_text()
     assert "hdfs-full-monty-v1" in notebook_text
+    assert "push_to_drive" in notebook_text
+    assert "stage_drive_prepare_artifacts" in notebook_text
+    assert "push_prepare_artifacts" in notebook_text
+    assert "push_campaign_arm" in notebook_text
+    assert "push_run_outputs" in notebook_text
+    assert "test_pr_curve.png" in notebook_text
+    assert "learning_curve.png" in notebook_text
+    assert "test_score_distribution.png" in notebook_text
+    assert "confusion_matrix.png" in notebook_text
+    assert "threshold = {float(threshold):.4f}" in notebook_text
     notebook = json.loads(notebook_text)
     import ast
 

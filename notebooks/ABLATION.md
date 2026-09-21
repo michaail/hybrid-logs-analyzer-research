@@ -161,6 +161,8 @@ python3 scripts/prepare_hdfs_campaign.py \
 
 Then train Family A, Isolation Forest, and the report (`experiment.dataset=hdfs`). Rank by test PR-AUC vs **`hybrid_llm`**. Chance is the HDFS positive-class rate (~0.03), not BGL’s ~0.099. Paired seed bootstrap applies; there is no BGL time-block CI on this stratified split. `SMOKE=True` caps prepare/train at 5000 graphs and 1 epoch — full HDFS is ~0.56M blocks.
 
+On Colab, [`Ablation_HDFS_Full_Monty.ipynb`](./Ablation_HDFS_Full_Monty.ipynb) pulls `campaigns/hdfs-full-monty-v1/_prepare/` (Drain + Deepseek) from Drive when those files exist, and pushes parser/enrichment, each arm’s graphs, and each seed’s eval pack (confusion matrix, learning curve, PR curve, score distribution with the validation threshold) back to `MyDrive/hybrid-log-analyzer-artifacts/` as soon as that step finishes.
+
 | Arm | What it tests |
 |---|---|
 | `tfidf_only` / `sbert_raw` / `sbert_llm` | Single embedding modality; raw Drain text vs LLM paragraph |
