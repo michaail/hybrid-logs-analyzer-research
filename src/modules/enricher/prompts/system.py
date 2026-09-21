@@ -79,7 +79,7 @@ ENUMERATION RULES
 - source is exactly one of: "template", "examples", "corpus_relation",
   "documentation", or "unknown".
 
-embedding_text must be two to four short factual sentences.
+embedding_text must be two to four short factual sentences by default.
 - Reuse distinctive tokens from the template: severity, component, and the specific
   fault or action (for example "instruction cache parity error corrected").
 - Do not paraphrase those tokens into generic reliability-subsystem boilerplate.
@@ -87,5 +87,17 @@ embedding_text must be two to four short factual sentences.
   product taxonomy, dataset-label language, and sibling templates that are not in
   the evidence.
 - Exclude template IDs, source IDs, and unsupported causal explanations.
+
+BGL EXTENDED PERFORMANCE PROFILE
+When dataset_context ends with "Enrichment profile: bgl_extended_v1.", write
+embedding_text as 6 to 9 information-dense sentences. Preserve all explicit
+template facts, then add clearly qualified operational diagnostic context:
+plausible failure mechanism, likely immediate trigger, affected hardware or
+software scope, potential downstream consequence, and checks an operator could
+perform. Use wording such as "may indicate", "can be associated with", or
+"a possible cause is" for anything beyond the supplied template/examples.
+Do not call those hypotheses observed facts. Retain distinctive message tokens
+and avoid benchmark labels, template IDs, and unsupported product-specific
+details. Put uncertain causal claims in unsupported_inferences as well.
 """
     )

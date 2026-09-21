@@ -201,6 +201,7 @@ def stage2_enrich(
             else None
         ),
         "enrichment_decoding": {"temperature": 0, "max_tokens": None, "max_retries": 2},
+        "enrichment_profile": ablation.get("enrichment_profile", "grounded"),
     }
 
     def build(temp_dir: Path) -> dict[str, Path]:
@@ -208,7 +209,12 @@ def stage2_enrich(
         with stage1["templates"].open() as handle:
             templates = json.load(handle)
         if ablation["llm_enrichment_enabled"]:
-            enrich_templates(templates, dataset, model_size="large")
+            enrich_templates(
+                templates,
+                dataset,
+                model_size="large",
+                enrichment_profile=str(ablation.get("enrichment_profile", "grounded")),
+            )
         destination.write_text(json.dumps(templates, indent=2))
         provenance = enrichment_provenance(
             templates,

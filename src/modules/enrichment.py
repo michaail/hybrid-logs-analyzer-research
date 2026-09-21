@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Bumped when the enricher system prompt changes. Stage-2 cache keys omit git SHA,
 # so this constant is what forces a re-enrich instead of reusing bland templates.
-ENRICHMENT_PROMPT_VERSION = "distinctive_v3"
+ENRICHMENT_PROMPT_VERSION = "bgl_extended_v1"
 
 
 class IncompleteEnrichmentError(ValueError):
@@ -131,6 +131,7 @@ def enrich_templates(
     templates_data: list[dict],
     dataset: str,
     model_size: str = "large",
+    enrichment_profile: str = "grounded",
 ) -> list[dict]:
     """Enrich a list of template dicts with LLM semantic annotations.
 
@@ -189,7 +190,8 @@ def enrich_templates(
                 context.dataset_context = (
                     "BGL source log messages carry event-level labels. When transformed "
                     "into time windows, a window is anomalous when it contains an "
-                    "anomalous event."
+                    "anomalous event. Enrichment profile: "
+                    f"{enrichment_profile}."
                 )
 
             result = enricher.enrich_template(context)

@@ -69,7 +69,9 @@ def fit_on_from_config(config: Mapping[str, Any]) -> str:
     silently change protocol.
     """
     representation = ((config.get("ablation") or {}).get("representation")) or {}
-    value = str(representation.get("fit_on") or "all").lower()
+    dataset = str((config.get("experiment") or {}).get("dataset") or "bgl").lower()
+    by_dataset = representation.get("fit_on_by_dataset") or {}
+    value = str(by_dataset.get(dataset, representation.get("fit_on") or "all")).lower()
     if value not in {"all", "train_only"}:
         raise ValueError(f"ablation.representation.fit_on must be 'all' or 'train_only', got {value!r}")
     return value

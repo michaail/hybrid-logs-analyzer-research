@@ -41,15 +41,20 @@ ablation:
   # Set stabilized_v2 only as an explicit Family A arm.
   feature_contract: notebook_raw_v1
   representation:
-    # train_only = inductive_v1 (Drain + TF-IDF fit on train units).
-    # all = transductive_v1 notebook ceiling; do not mix split locks.
+    # HDFS remains inductive. BGL overrides it below for the transductive
+    # performance protocol, where Drain + TF-IDF see the full unlabeled corpus.
     fit_on: train_only
+    fit_on_by_dataset:
+      bgl: all
   embeddings:
     tfidf_enabled: true
     sbert_enabled: true
     # embedding_text = LLM paragraph only (template fallback if enrichment is off).
     # grounded_v1 = enrichment fields only; MiniLM never sees Drain templates.
     sbert_text: embedding_text
+  # grounded = short factual text; bgl_extended_v1 = longer BGL diagnostic
+  # hypotheses for performance experiments (not a leakage-controlled protocol).
+  enrichment_profile: bgl_extended_v1
   fusion:
     # all = reconstruct every node column. without_sbert = TF-IDF + extras only.
     node_reconstruct: all

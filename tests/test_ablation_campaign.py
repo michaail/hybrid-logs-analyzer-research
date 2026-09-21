@@ -105,7 +105,7 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     assert base["parser"]["bgl"]["raw_file"] == "bgl/BGL_full.log"
     assert base["sequencing"]["bgl"]["step_minutes"] == base["sequencing"]["bgl"]["window_minutes"]
     assert base["sequencing"]["bgl"]["split"] == "time"
-    assert base["ablation"]["representation"]["fit_on"] == "train_only"
+    assert base["ablation"]["representation"]["fit_on_by_dataset"]["bgl"] == "all"
     assert base["ablation"]["graph"]["structure_decoder"] == "mlp"
     prepare_hdfs = (REPOSITORY_ROOT / "scripts" / "prepare_hdfs_campaign.py").read_text()
     assert "parser.hdfs.raw_file=hdfs/HDFS_full.log" in prepare_hdfs
@@ -121,7 +121,7 @@ def test_bgl_representation_yaml_omits_hdfs_feature_contract() -> None:
     assert "enrichment_prompt_version" in run_ablation_src
     from src.modules.enrichment import ENRICHMENT_PROMPT_VERSION
 
-    assert ENRICHMENT_PROMPT_VERSION == "distinctive_v3"
+    assert ENRICHMENT_PROMPT_VERSION == "bgl_extended_v1"
     enrichment_src = (REPOSITORY_ROOT / "src" / "modules" / "enrichment.py").read_text()
     assert "AZURE_OPENAI_DEPLOYMENT_DEEPSEEK_V4_PRO" in enrichment_src
     assert "AZURE_OPENAI_DEPLOYMENT_MISTRAL_LARGE" not in enrichment_src
@@ -560,3 +560,13 @@ def test_node_reconstruct_is_not_graph_identity() -> None:
     identity = graph_identity_from_config(config)
     assert "node_reconstruct" not in identity
     assert identity["sbert_text"] == "embedding_text"
+
+
+def test_bgl_uses_transductive_performance_fit_without_changing_hdfs_default() -> None:
+    from src.modules.ablation import fit_on_from_config
+
+    hdfs = _baseline_config()
+    bgl = _baseline_config()
+    bgl["experiment"]["dataset"] = "bgl"
+    assert fit_on_from_config(hdfs) == "train_only"
+    assert fit_on_from_config(bgl) == "all"
