@@ -464,6 +464,9 @@ def attach_cluster_embeddings(
 
         id_col = structure["id_col"]
         kwargs = {id_col: structure["seq_id"], "num_nodes": int(structure["num_nodes"])}
+        kwargs["event_cluster_ids"] = _as_owned_tensor(
+            np.asarray(structure["event_cluster_ids"], dtype=np.int64), dtype=torch.long
+        )
         all_data.append(
             Data(
                 x=_as_owned_tensor(node_feats, dtype=torch.float32),
@@ -939,6 +942,7 @@ def _seq_to_structure(
         edge_attr = np.zeros((0, STRUCTURE_EDGE_DIM), dtype=np.float32)
 
     return {
+        "event_cluster_ids": np.asarray(cids, dtype=np.int64),
         "cluster_ids": np.asarray(unique_cids, dtype=np.int64),
         "node_extra": node_extra,
         "edge_index": edge_index,

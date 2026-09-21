@@ -94,3 +94,9 @@ training:
   gamma: 1.0
   pre_normalize_edges: true
   minimum_edge_std: 0.1
+
+baseline:
+  isolation_forest:
+    seeds: [13, 29, 42, 71, 101]
+    n_estimators: 300
+    max_samples: 256

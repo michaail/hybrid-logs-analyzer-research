@@ -914,6 +914,9 @@ def write_campaign_report(
     summary_frame, paired_frame = _seeded_campaign_statistics(frame, baseline_name)
     summary_frame.to_csv(campaign_dir / "summary_by_arm.csv", index=False)
     paired_frame.to_csv(campaign_dir / "paired_bootstrap_ci.csv", index=False)
+    time_block_frame = _bgl_time_block_bootstrap(records, baseline_name=baseline_name)
+    if not time_block_frame.empty:
+        time_block_frame.to_csv(campaign_dir / "paired_time_block_bootstrap.csv", index=False)
 
     delta_path = campaign_dir / "delta_vs_baseline.csv"
     if not paired_frame.empty:
@@ -923,6 +926,63 @@ def write_campaign_report(
     readme = campaign_dir / "README.md"
     readme.write_text(_campaign_readme(campaign_id, dataset, frame, baseline_name))
     return json_path
+
+
+def _bgl_time_block_bootstrap(
+    records: list[dict[str, Any]], *, baseline_name: str, samples: int = 2_000
+) -> pd.DataFrame:
+    """Paired AP deltas resampled by BGL day and seven-day time blocks."""
+    baseline_records = [item for item in records if item.get("name") == baseline_name]
+    rows: list[dict[str, Any]] = []
+    for base in baseline_records:
+        for arm in records:
+            if arm.get("name") == baseline_name or arm.get("seed") != base.get("seed"):
+                continue
+            base_path = Path(str(base["run_dir"])) / "scores" / "test_component_scores.csv"
+            arm_path = Path(str(arm["run_dir"])) / "scores" / "test_component_scores.csv"
+            if not base_path.exists() or not arm_path.exists():
+                continue
+            merged = pd.read_csv(base_path)[["graph_id", "label", "score"]].merge(
+                pd.read_csv(arm_path)[["graph_id", "label", "score"]],
+                on=["graph_id", "label"], suffixes=("_baseline", "_arm"),
+            )
+            if merged.empty or merged["label"].nunique() != 2:
+                continue
+            try:
+                from sklearn.metrics import average_precision_score
+                from src.modules.sequencer import BGL_SPLIT_STRIDE
+                graph_ids = pd.to_numeric(merged["graph_id"], errors="raise").astype(np.int64)
+            except (ImportError, ValueError, TypeError):
+                continue
+            unix_start = graph_ids % BGL_SPLIT_STRIDE
+            for days in (1, 7):
+                blocks = (unix_start // (days * 86_400)).to_numpy()
+                unique = np.unique(blocks)
+                if len(unique) < 2:
+                    continue
+                rng = np.random.default_rng(20_260 + int(base["seed"]))
+                deltas: list[float] = []
+                for _ in range(samples):
+                    picked = rng.choice(unique, size=len(unique), replace=True)
+                    indices = np.concatenate([np.flatnonzero(blocks == item) for item in picked])
+                    labels = merged["label"].to_numpy()[indices]
+                    if len(np.unique(labels)) != 2:
+                        continue
+                    deltas.append(float(
+                        average_precision_score(labels, merged["score_arm"].to_numpy()[indices])
+                        - average_precision_score(labels, merged["score_baseline"].to_numpy()[indices])
+                    ))
+                if deltas:
+                    rows.append({
+                        "baseline": baseline_name, "name": arm["name"], "seed": arm["seed"],
+                        "block_days": days, "n_blocks": len(unique), "n_bootstrap": len(deltas),
+                        "ap_delta": float(average_precision_score(merged["label"], merged["score_arm"])
+                                          - average_precision_score(merged["label"], merged["score_baseline"])),
+                        "ci95_low": float(np.quantile(deltas, 0.025)),
+                        "ci95_high": float(np.quantile(deltas, 0.975)),
+                        "bootstrap_unit": "paired_time_block",
+                    })
+    return pd.DataFrame(rows)
 
 
 def _seeded_campaign_statistics(

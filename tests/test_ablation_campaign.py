@@ -373,6 +373,34 @@ def test_seeded_statistics_require_same_frozen_split_lock() -> None:
     assert paired[paired["name"] == "arm"].empty
 
 
+def test_campaign_preparation_preserves_previously_prepared_graph_entries() -> None:
+    source = (REPOSITORY_ROOT / "run_ablation.py").read_text()
+    assert "merged_graphs = {**previous_graphs" in source
+    assert "graphs=[merged_graphs[name] for name in sorted(merged_graphs)]" in source
+
+
+def test_bgl_time_block_bootstrap_reports_paired_ap_uncertainty(tmp_path: Path) -> None:
+    import pandas as pd
+
+    from src.modules.ablation import _bgl_time_block_bootstrap
+
+    score_dir = tmp_path / "scores"
+    score_dir.mkdir()
+    graph_ids = [10, 86_410, 691_210, 777_610]
+    for name, scores in (("baseline", [0.1, 0.2, 0.7, 0.8]), ("arm", [0.2, 0.3, 0.8, 0.9])):
+        directory = tmp_path / name / "scores"
+        directory.mkdir(parents=True)
+        pd.DataFrame({"graph_id": graph_ids, "label": [0, 0, 1, 1], "score": scores}).to_csv(
+            directory / "test_component_scores.csv", index=False
+        )
+    frame = _bgl_time_block_bootstrap([
+        {"name": "hybrid_llm", "seed": 13, "run_dir": str(tmp_path / "baseline")},
+        {"name": "arm", "seed": 13, "run_dir": str(tmp_path / "arm")},
+    ], baseline_name="hybrid_llm", samples=40)
+    assert set(frame["block_days"]) == {1, 7}
+    assert (frame["bootstrap_unit"] == "paired_time_block").all()
+
+
 def test_fingerprint_ignores_git_revision() -> None:
     inputs = [{"path": "a", "size_bytes": 1, "modified_ns": 2}]
     first = fingerprint(config={"x": 1}, inputs=inputs, revision="aaa")

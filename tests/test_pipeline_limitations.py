@@ -232,6 +232,21 @@ def test_oov_cluster_id_is_negative() -> None:
     assert OOV_CLUSTER_ID < 0
 
 
+def test_isolation_forest_features_use_training_template_vocabulary_only() -> None:
+    from src.modules.classical_baseline import window_feature_matrices
+
+    class _Graph:
+        def __init__(self, cluster_ids: list[int]) -> None:
+            self.event_cluster_ids = cluster_ids
+
+    train, test = window_feature_matrices(
+        [_Graph([1, 1, 2]), _Graph([2])], [_Graph([1, 3, -1])]
+    )
+    assert train.shape == (2, 4)  # templates 1/2, OOV share, log length
+    np.testing.assert_array_equal(test[0, :2], [1.0, 0.0])
+    assert test[0, -2] == pytest.approx(1 / 3)
+
+
 def test_unmatched_oov_assigns_negative_cluster(tmp_path: Path) -> None:
     from src.modules.parser.drain_parser import DrainParser
 

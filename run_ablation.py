@@ -86,6 +86,7 @@ from src.modules.enrichment import (
     require_valid_enrichment_provenance,
 )
 from src.modules.graph_builder import select_unique_sequences
+from src.modules.classical_baseline import window_feature_matrices
 from src.modules.inference_release import (
     HdfsReleaseIdentity,
     HdfsReleaseSource,
@@ -1190,6 +1191,57 @@ def _train_graph_bundle(
     return metrics, checkpoint, eval_payload
 
 
+def _train_isolation_forest_bundle(
+    graph_path: Path, *, seed: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fit the pre-registered non-GNN baseline on frozen BGL graph splits."""
+    from sklearn.ensemble import IsolationForest
+    from sklearn.metrics import confusion_matrix, precision_score, recall_score
+
+    train_graphs, val_graphs, test_graphs, _ = load_graph_splits(graph_path)
+    clean_train = [graph for graph in train_graphs if int(graph.y.item()) == 0]
+    if not clean_train:
+        raise ValueError("No normal training windows remain for Isolation Forest.")
+    x_train, x_val, x_test = window_feature_matrices(clean_train, val_graphs, test_graphs)
+    model = IsolationForest(
+        n_estimators=300,
+        max_samples=min(256, len(x_train)),
+        contamination="auto",
+        random_state=seed,
+        n_jobs=-1,
+    )
+    model.fit(x_train)
+    # sklearn's score_samples is higher for inliers; negate it for anomaly scoring.
+    val_scores = -model.score_samples(x_val)
+    val_labels = np.asarray([int(graph.y.item()) for graph in val_graphs])
+    threshold, val_metrics = _threshold_and_metrics(val_labels, val_scores)
+    test_scores = -model.score_samples(x_test)
+    test_labels = np.asarray([int(graph.y.item()) for graph in test_graphs])
+    test_metrics = _score_metrics(test_labels, test_scores, threshold)
+    predictions = (test_scores > threshold).astype(int)
+    test_metrics.update(
+        {
+            "precision": _rounded(precision_score(test_labels, predictions, zero_division=0)),
+            "recall": _rounded(recall_score(test_labels, predictions, zero_division=0)),
+            "confusion_matrix": confusion_matrix(test_labels, predictions, labels=[0, 1]).tolist(),
+        }
+    )
+    metrics = {
+        "best_threshold": _rounded(threshold),
+        "val_f1": val_metrics["f1"], "val_pr_auc": val_metrics["pr_auc"], "val_roc_auc": val_metrics["roc_auc"],
+        "test_f1": test_metrics["f1"], "test_pr_auc": test_metrics["pr_auc"], "test_roc_auc": test_metrics["roc_auc"],
+        "test_precision": test_metrics["precision"], "test_recall": test_metrics["recall"],
+        "test_confusion_matrix": test_metrics["confusion_matrix"],
+        "n_train": len(clean_train), "n_val": len(val_graphs), "n_test": len(test_graphs),
+        "baseline": "isolation_forest", "n_estimators": 300, "max_samples": min(256, len(x_train)),
+    }
+    payload = {
+        "test_scores": test_scores, "test_labels": test_labels,
+        "graph_ids": sequence_ids_from_graphs(test_graphs),
+    }
+    return metrics, payload
+
+
 def _node_recon_index_for_bundle(
     *,
     node_dim: int,
@@ -1898,6 +1950,15 @@ def prepare_representation_campaign(
             loaded = {}
         if isinstance(loaded, dict):
             previous = loaded
+    previous_graphs = {
+        str(item.get("name")): item
+        for item in previous.get("graphs", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    # A BGL research campaign is prepared in stages: representation arms first,
+    # then PB3 arms. Keep manifest entries for completed arms that are absent
+    # from the current matrix, while replacing any arm rebuilt in this pass.
+    merged_graphs = {**previous_graphs, **{str(item["name"]): item for item in graphs}}
     extra = {
         "code_sha": git_revision(code),
         "matrix": str(matrix_file),
@@ -1910,7 +1971,7 @@ def prepare_representation_campaign(
         campaign_id=campaign_id,
         dataset=dataset,
         family="representation",
-        graphs=graphs,
+        graphs=[merged_graphs[name] for name in sorted(merged_graphs)],
         split_lock=split_lock_path if split_lock_path.exists() else None,
         extra=extra,
     )
@@ -2178,6 +2239,59 @@ def _run_campaign_dir(args: argparse.Namespace, base_config: dict[str, Any]) -> 
     return 0 if all(result["status"] == "OK" for result in results) else 1
 
 
+def _run_isolation_forest_campaign(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Train the prescribed simple BGL baseline from the frozen hybrid graph."""
+    if _dataset(config) != "bgl":
+        raise ValueError("Isolation Forest campaign mode is registered for BGL only.")
+    if not args.campaign_dir:
+        raise ValueError("--campaign-dir is required for --mode isolation-forest.")
+    campaign_dir = Path(args.campaign_dir).resolve()
+    manifest = json.loads((campaign_dir / "manifest.json").read_text())
+    baseline_graph = next(
+        (item for item in manifest.get("graphs", []) if item.get("name") == "hybrid_llm"), None
+    )
+    if baseline_graph is None:
+        raise FileNotFoundError("Prepared campaign must contain the hybrid_llm graph bundle.")
+    workspace = Path(args.workspace_root).resolve()
+    campaign_id = str(manifest.get("campaign_id") or args.campaign_id or campaign_dir.name)
+    compressed = campaign_dir / baseline_graph["graph_dataset"]
+    graph_path = workspace / "data" / "processed" / "bgl" / f"{_safe_name(campaign_id)}_iforest.pt"
+    graph_path = gunzip_file(compressed, graph_path)
+    meta_relative = baseline_graph.get("dataset_meta")
+    if meta_relative and (campaign_dir / meta_relative).exists():
+        shutil.copy2(campaign_dir / meta_relative, graph_path.with_name("dataset_meta.json"))
+    seeds = config.get("baseline", {}).get("isolation_forest", {}).get("seeds", [13, 29, 42, 71, 101])
+    try:
+        for raw_seed in seeds:
+            seed = int(raw_seed)
+            run_id = f"{_safe_name(campaign_id)}_isolation_forest_seed{seed}"
+            output_dir = workspace / config["paths"]["outputs_dir"] / "bgl" / run_id
+            if (output_dir / "metrics.json").exists():
+                print(f"[SKIP] isolation_forest seed={seed}")
+                continue
+            metrics, payload = _train_isolation_forest_bundle(graph_path, seed=seed)
+            campaign_meta = {
+                "campaign_id": campaign_id, "family": "baseline",
+                "experiment_name": "isolation_forest", "run_id": run_id,
+                "seed": seed, "split_lock_id": (load_bundle_meta(graph_path) or {}).get("split_lock_id"),
+                "baseline_features": "train_template_counts,oov_share,log1p_window_length",
+            }
+            zeros = np.zeros_like(payload["test_scores"], dtype=float)
+            write_eval_pack(
+                output_dir, metrics=metrics, history_epochs=[], labels=payload["test_labels"],
+                scores=payload["test_scores"], structure=zeros, node=zeros, edge=zeros,
+                threshold=float(metrics["best_threshold"]), alpha=1.0, beta=1.0, gamma=1.0,
+                graph_ids=payload["graph_ids"], config=config, campaign_meta=campaign_meta,
+            )
+            print(f"[BASELINE] isolation_forest seed={seed} → {output_dir}")
+    finally:
+        if graph_path.exists():
+            graph_path.unlink()
+    report = write_campaign_report(workspace, dataset="bgl", campaign_id=_safe_name(campaign_id), baseline_name="hybrid_llm")
+    print(f"Isolation Forest campaign report: {report}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2188,10 +2302,11 @@ def build_parser() -> argparse.ArgumentParser:
             "smoke",
             "export-inference-release",
             "prepare-campaign",
+            "isolation-forest",
             "report",
         ),
         default="full",
-        help="Full raw-log pipeline, train-only, smoke, release export, local Family A prepare, or campaign report.",
+        help="Full pipeline, train-only, smoke, release export, Family A prepare, BGL Isolation Forest, or campaign report.",
     )
     parser.add_argument(
         "--config",
@@ -2314,6 +2429,8 @@ def main() -> int:
         )
         print(f"Campaign report: {summary}")
         return 0
+    if args.mode == "isolation-forest":
+        return _run_isolation_forest_campaign(args, config)
     family = (args.family or "").lower()
     if args.mode == "smoke":
         config = apply_overrides(
