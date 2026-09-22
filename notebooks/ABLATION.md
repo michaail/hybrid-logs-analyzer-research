@@ -14,6 +14,7 @@ This file is the operational contract. Implementation lives in this repository (
 | **A — representation (BGL, broader)** | `configs/ablation_representation_bgl.yaml` | Yes | separate campaign; `baseline_full` |
 | **A — fusion / grounded text (BGL)** | `configs/ablation_fusion_bgl.yaml` | Yes | same, new campaign id, reuse the inductive `split_lock.npz` |
 | **B — train / architecture** | `configs/ablation_train.yaml` | No | `--mode train-only --family B` on `baseline_full` |
+| **B — HDFS notebook graph (20260818)** | `configs/ablation_hdfs_train.yaml` | No | [`Ablation_HDFS_FamilyB.ipynb`](./Ablation_HDFS_FamilyB.ipynb); same arms as `ablation_train.yaml` |
 
 `configs/ablation_matrix.yaml` is deprecated. It now re-exports Family B only so an accidental shared-graph `train-only` run cannot fake a TF-IDF vs SBERT ablation.
 
@@ -162,6 +163,24 @@ python3 scripts/prepare_hdfs_campaign.py \
 Then train Family A, Isolation Forest, and the report (`experiment.dataset=hdfs`). Rank by test PR-AUC vs **`hybrid_llm`**. Chance is the HDFS positive-class rate (~0.03), not BGL’s ~0.099. Paired seed bootstrap applies; there is no BGL time-block CI on this stratified split. `SMOKE=True` caps prepare/train at 5000 graphs and 1 epoch — full HDFS is ~0.56M blocks.
 
 On Colab, [`Ablation_HDFS_Full_Monty.ipynb`](./Ablation_HDFS_Full_Monty.ipynb) pulls `campaigns/hdfs-full-monty-v1/_prepare/` (Drain + Deepseek) from Drive when those files exist, and pushes parser/enrichment, each arm’s graphs, and each seed’s eval pack (confusion matrix, learning curve, PR curve, score distribution with the validation threshold) back to `MyDrive/hybrid-log-analyzer-artifacts/` as soon as that step finishes.
+
+### HDFS Family B on the 20260818 notebook graph
+
+Train-only port of `configs/ablation_train.yaml` (the BGL Family B model/loss arms) onto the frozen bundle used by [`legacy/6_GAE_Training_Colab.ipynb`](../legacy/6_GAE_Training_Colab.ipynb):
+
+`data/processed/hdfs/20260818_0002_1_parser_3_graph_dataset.pt.gz`
+
+Self-contained notebook: [`Ablation_HDFS_FamilyB.ipynb`](./Ablation_HDFS_FamilyB.ipynb). No Drain/Deepseek. One cell per arm (`baseline_full`, GINE mean/max, linear node transform, latent 32, hidden 256, lr 0.001, γ=0.5, inner-product decoder, α/β/γ = 0, lexical node recon). Clean-train GAE at Adam **lr 0.001** (BGL default; `ablation_hdfs_train.yaml` overrides `training.learning_rate.hdfs` so CLI does not pick up `ablation_base.yaml`'s HDFS 0.01). Five seeds, rank by test PR-AUC vs **`baseline_full`**. The `learning_rate_001` arm is kept for matrix identity and is a no-op vs baseline. Colab copies each seed’s eval pack to Drive when it finishes. Do **not** compare these numbers to `hdfs-full-monty-v1` (different graph and split). `SMOKE=True` is 1 epoch and ≤5000 graphs.
+
+CLI equivalent:
+
+```bash
+python run_ablation.py --mode train-only --family B \
+  --config configs/ablation_base.yaml \
+  --matrix configs/ablation_hdfs_train.yaml \
+  --graph-dataset data/processed/hdfs/20260818_0002_1_parser_3_graph_dataset.pt \
+  --workspace-root .
+```
 
 | Arm | What it tests |
 |---|---|

@@ -1,0 +1,111 @@
+# Family B architecture / loss / hyperparameter ablations on the frozen
+# 20260818 HDFS notebook graph (legacy/6_GAE_Training_Colab.ipynb).
+# Arm names and overrides match configs/ablation_train.yaml (the BGL Family B
+# matrix). Graphs are not rebuilt. Notebook:
+# notebooks/Ablation_HDFS_FamilyB.ipynb
+#
+# CLI (same tensors as the notebook):
+#   python run_ablation.py --mode train-only --family B \
+#     --config configs/ablation_base.yaml \
+#     --matrix configs/ablation_hdfs_train.yaml \
+#     --graph-dataset data/processed/hdfs/20260818_0002_1_parser_3_graph_dataset.pt \
+#     --workspace-root .
+family: train
+requires_graph_rebuild: false
+seeds: [13, 29, 42, 71, 101]
+config_overrides:
+  experiment.dataset: hdfs
+  training.train_mode: clean
+  # Match BGL Family B (ablation_base.yaml uses training.learning_rate.hdfs: 0.01).
+  training.learning_rate.hdfs: 0.001
+experiments:
+  - name: baseline_full
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: baseline_full
+
+  - name: gine_mean_agg
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: gine_mean_agg
+      ablation.graph.gine_aggregation: mean
+
+  - name: gine_max_agg
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: gine_max_agg
+      ablation.graph.gine_aggregation: max
+
+  - name: linear_node_transform
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: linear_node_transform
+      ablation.graph.node_transformation: linear
+
+  - name: latent_32
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: latent_32
+      training.latent_dim: 32
+
+  - name: hidden_256
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: hidden_256
+      training.hidden_dim: 256
+
+  - name: learning_rate_001
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: learning_rate_001
+      training.learning_rate.hdfs: 0.001
+      training.learning_rate.bgl: 0.001
+
+  - name: gamma_05
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: gamma_05
+      training.gamma: 0.5
+
+  - name: inner_product_structure
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: inner_product_structure
+      ablation.graph.structure_decoder: inner_product
+
+  - name: alpha_0
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: alpha_0
+      training.alpha: 0.0
+
+  - name: beta_0
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: beta_0
+      training.beta: 0.0
+
+  - name: gamma_0
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: gamma_0
+      training.gamma: 0.0
+
+  - name: lexical_node_recon
+    enabled: true
+    requires_graph_rebuild: false
+    overrides:
+      experiment.name: lexical_node_recon
+      ablation.fusion.node_reconstruct: without_sbert

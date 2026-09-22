@@ -237,6 +237,73 @@ def test_hdfs_full_monty_matrices_match_bgl_arms_and_force_fit_on_all() -> None:
     ) == "hybrid_llm"
 
 
+def test_hdfs_family_b_notebook_uses_legacy_graph_and_bgl_train_arms() -> None:
+    from run_ablation import apply_overrides, load_config, matrix_config_override_strings
+
+    matrix = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_hdfs_train.yaml")
+    bgl_train = load_matrix(REPOSITORY_ROOT / "configs" / "ablation_train.yaml")
+    assert matrix["family"] == "train"
+    assert matrix["requires_graph_rebuild"] is False
+    assert matrix["seeds"] == [13, 29, 42, 71, 101]
+    assert {item["name"] for item in enabled_experiments(matrix)} == {
+        item["name"] for item in enabled_experiments(bgl_train)
+    }
+    assert matrix["config_overrides"]["experiment.dataset"] == "hdfs"
+    assert matrix["config_overrides"]["training.train_mode"] == "clean"
+    assert float(matrix["config_overrides"]["training.learning_rate.hdfs"]) == 0.001
+    config = load_config(REPOSITORY_ROOT / "configs" / "ablation_base.yaml")
+    updated = apply_overrides(config, matrix_config_override_strings(matrix))
+    assert updated["experiment"]["dataset"] == "hdfs"
+    assert updated["training"]["train_mode"] == "clean"
+    assert float(updated["training"]["learning_rate"]["hdfs"]) == 0.001
+
+    notebook_path = REPOSITORY_ROOT / "notebooks" / "Ablation_HDFS_FamilyB.ipynb"
+    notebook_text = notebook_path.read_text()
+    assert "20260818_0002_1_parser_3_graph_dataset.pt.gz" in notebook_text
+    assert "hdfs-family-b-legacy-v1" in notebook_text
+    assert "legacy/6_GAE_Training_Colab.ipynb" in notebook_text
+    for arm in (
+        "baseline_full",
+        "gine_mean_agg",
+        "gine_max_agg",
+        "linear_node_transform",
+        "latent_32",
+        "hidden_256",
+        "learning_rate_001",
+        "gamma_05",
+        "inner_product_structure",
+        "alpha_0",
+        "beta_0",
+        "gamma_0",
+        "lexical_node_recon",
+    ):
+        assert arm in notebook_text
+    assert "push_to_drive" in notebook_text
+    assert "test_pr_curve.png" in notebook_text
+    assert "test_score_distribution.png" in notebook_text
+    notebook = json.loads(notebook_text)
+    notebook_source = "\n".join(
+        "".join(item.get("source") or []) for item in notebook["cells"]
+    )
+    assert '"learning_rate": 0.001' in notebook_source
+    assert '"learning_rate": 0.01' not in notebook_source
+    import ast
+
+    for item in notebook["cells"]:
+        if item.get("cell_type") != "code":
+            continue
+        source = "".join(item.get("source") or [])
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert all(alias.name.split(".", 1)[0] != "run_ablation" for alias in node.names)
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert not node.module.startswith("src"), item.get("id")
+    ablation = (REPOSITORY_ROOT / "notebooks" / "ABLATION.md").read_text()
+    assert "ablation_hdfs_train.yaml" in ablation
+    assert "Ablation_HDFS_FamilyB.ipynb" in ablation
+
+
 def test_graph_identity_tracks_feature_group_ablations() -> None:
     baseline = _baseline_config()
     no_position = _baseline_config()
